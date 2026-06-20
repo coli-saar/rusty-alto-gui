@@ -4,8 +4,8 @@ use crate::model::{
 };
 use packed_term_arena::tree::{Tree, TreeArena};
 use rusty_alto::{
-    Explicit, Irtg, LanguageCardinality, ParseStrategy, RenderedValue, Signature, Symbol,
-    TreeValue, parse_irtg,
+    Explicit, Irtg, LanguageCardinality, ParseStrategy, RenderedValue, Symbol, TreeValue,
+    parse_irtg,
 };
 use std::{
     collections::HashMap,
@@ -50,6 +50,7 @@ pub fn load_grammar(path: PathBuf) -> Result<GrammarDocument, String> {
     let grammar = Arc::new(parse_irtg(file).map_err(|error| error.to_string())?);
     let summary = grammar.grammar().application_summary();
     let interpretations = grammar.interpretation_info();
+    let interpretation_names = interpretations.iter().map(|info| info.name.clone()).collect();
     let rules = grammar
         .resolved_grammar_rules()
         .iter()
@@ -60,6 +61,7 @@ pub fn load_grammar(path: PathBuf) -> Result<GrammarDocument, String> {
         grammar,
         summary,
         interpretations,
+        interpretation_names,
         rules,
     })
 }
@@ -189,13 +191,15 @@ fn prepare_and_run_language(
                         .homomorphism()
                         .apply(&arena, root, &mut term_arena)
                         .map(|term_root| {
+                            let signature = interpretation.algebra_signature();
+                            let layout = layout_tree_nodes(term_root, &|node| {
+                                signature.resolve(*term_arena.get_label(node)).to_owned()
+                            }, &|node| {
+                                term_arena.get_children(node).to_vec()
+                            });
                             (
                                 interpretation.name().to_owned(),
-                                format_term(
-                                    &term_arena,
-                                    term_root,
-                                    interpretation.algebra_signature(),
-                                ),
+                                Arc::new(layout),
                             )
                         })
                 })
@@ -247,40 +251,33 @@ fn view_from_tree(name: impl Into<String>, tree: &TreeValue) -> ViewContent {
     }
 }
 
-fn format_term(arena: &TreeArena<Symbol>, node: Tree, signature: &Signature) -> String {
-    let label = signature.resolve(*arena.get_label(node));
-    let children = arena.get_children(node);
-    if children.is_empty() {
-        label.to_owned()
-    } else {
-        format!(
-            "{label}({})",
-            children
-                .iter()
-                .map(|&child| format_term(arena, child, signature))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-}
+const TREE_H_GAP: f32 = 28.0;
+const TREE_V_GAP: f32 = 74.0;
+const TREE_NODE_HEIGHT: f32 = 30.0;
+const TREE_MARGIN: f32 = 28.0;
 
-fn layout_tree(tree: &TreeValue) -> TreeLayout {
-    const H_GAP: f32 = 28.0;
-    const V_GAP: f32 = 74.0;
-    const NODE_HEIGHT: f32 = 30.0;
-    const MARGIN: f32 = 28.0;
-
-    fn visit(
-        tree: &TreeValue,
-        node: packed_term_arena::tree::Tree,
+/// Lay out any tree given accessors for a node's label and children. Used for
+/// derivation trees, tree-valued interpretations, and interpretation terms.
+fn layout_tree_nodes<L, C>(root: Tree, label_of: &L, children_of: &C) -> TreeLayout
+where
+    L: Fn(Tree) -> String,
+    C: Fn(Tree) -> Vec<Tree>,
+{
+    fn visit<L, C>(
+        node: Tree,
         depth: usize,
         left: f32,
         layout: &mut TreeLayout,
-    ) -> (usize, f32) {
-        let arena = tree.arena();
-        let label = arena.get_label(node).clone();
+        label_of: &L,
+        children_of: &C,
+    ) -> (usize, f32)
+    where
+        L: Fn(Tree) -> String,
+        C: Fn(Tree) -> Vec<Tree>,
+    {
+        let label = label_of(node);
         let node_width = (label.chars().count() as f32 * 7.5 + 22.0).clamp(58.0, 220.0);
-        let children = arena.get_children(node);
+        let children = children_of(node);
         let mut child_centers = Vec::new();
         let subtree_width = if children.is_empty() {
             node_width
@@ -288,10 +285,11 @@ fn layout_tree(tree: &TreeValue) -> TreeLayout {
             let mut cursor = left;
             let mut total = 0.0;
             for (index, child) in children.iter().copied().enumerate() {
-                let (child_index, child_width) = visit(tree, child, depth + 1, cursor, layout);
+                let (child_index, child_width) =
+                    visit(child, depth + 1, cursor, layout, label_of, children_of);
                 child_centers.push((child_index, layout.nodes[child_index].x));
-                cursor += child_width + H_GAP;
-                total += child_width + if index > 0 { H_GAP } else { 0.0 };
+                cursor += child_width + TREE_H_GAP;
+                total += child_width + if index > 0 { TREE_H_GAP } else { 0.0 };
             }
             total.max(node_width)
         };
@@ -304,13 +302,13 @@ fn layout_tree(tree: &TreeValue) -> TreeLayout {
         layout.nodes.push(TreeNode {
             label,
             x: center,
-            y: depth as f32 * V_GAP,
+            y: depth as f32 * TREE_V_GAP,
             width: node_width,
         });
         for (child_index, child_x) in child_centers {
             layout.edges.push(TreeEdge {
                 parent_x: center,
-                parent_y: depth as f32 * V_GAP + NODE_HEIGHT,
+                parent_y: depth as f32 * TREE_V_GAP + TREE_NODE_HEIGHT,
                 child_x,
                 child_y: layout.nodes[child_index].y,
             });
@@ -319,21 +317,31 @@ fn layout_tree(tree: &TreeValue) -> TreeLayout {
     }
 
     let mut layout = TreeLayout::default();
-    let (_, width) = visit(tree, tree.root(), 0, 0.0, &mut layout);
-    layout.width = width + MARGIN * 2.0;
-    layout.height =
-        layout.nodes.iter().map(|node| node.y).fold(0.0, f32::max) + NODE_HEIGHT + MARGIN * 2.0;
+    let (_, width) = visit(root, 0, 0.0, &mut layout, label_of, children_of);
+    layout.width = width + TREE_MARGIN * 2.0;
+    layout.height = layout.nodes.iter().map(|node| node.y).fold(0.0, f32::max)
+        + TREE_NODE_HEIGHT
+        + TREE_MARGIN * 2.0;
     for node in &mut layout.nodes {
-        node.x += MARGIN;
-        node.y += MARGIN;
+        node.x += TREE_MARGIN;
+        node.y += TREE_MARGIN;
     }
     for edge in &mut layout.edges {
-        edge.parent_x += MARGIN;
-        edge.parent_y += MARGIN;
-        edge.child_x += MARGIN;
-        edge.child_y += MARGIN;
+        edge.parent_x += TREE_MARGIN;
+        edge.parent_y += TREE_MARGIN;
+        edge.child_x += TREE_MARGIN;
+        edge.child_y += TREE_MARGIN;
     }
     layout
+}
+
+fn layout_tree(tree: &TreeValue) -> TreeLayout {
+    let arena = tree.arena();
+    layout_tree_nodes(
+        tree.root(),
+        &|node| arena.get_label(node).clone(),
+        &|node| arena.get_children(node).to_vec(),
+    )
 }
 
 #[cfg(test)]

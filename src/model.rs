@@ -11,10 +11,8 @@ pub enum DocumentTab {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleColumn {
-    State,
     Rule,
     Weight,
-    Interpretations,
 }
 
 #[derive(Debug, Clone)]
@@ -22,7 +20,8 @@ pub struct RuleRow {
     pub parent: String,
     pub rhs: String,
     pub weight: f64,
-    pub terms: String,
+    /// Homomorphism term per interpretation, in grammar order.
+    pub interpretations: Vec<String>,
 }
 
 impl RuleRow {
@@ -39,12 +38,11 @@ impl RuleRow {
                 format!("{}({})", rule.symbol, rule.children.join(", "))
             },
             weight: rule.weight,
-            terms: rule
+            interpretations: rule
                 .interpretation_terms
                 .iter()
-                .map(|(name, term)| format!("{name}: {term}"))
-                .collect::<Vec<_>>()
-                .join("   "),
+                .map(|(_, term)| term.clone())
+                .collect(),
         }
     }
 }
@@ -61,6 +59,8 @@ pub struct GrammarDocument {
     pub grammar: Arc<Irtg>,
     pub summary: AutomatonSummary,
     pub interpretations: Vec<InterpretationInfo>,
+    /// Interpretation names in grammar order (column headers for the rule table).
+    pub interpretation_names: Vec<String>,
     pub rules: Vec<RuleRow>,
 }
 
@@ -152,7 +152,7 @@ pub struct TreeEdge {
 pub struct ViewContent {
     pub name: String,
     pub value: String,
-    pub term: Option<String>,
+    pub term: Option<Arc<TreeLayout>>,
     pub tree: Option<Arc<TreeLayout>>,
 }
 

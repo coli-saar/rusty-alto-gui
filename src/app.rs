@@ -12,7 +12,7 @@ use iced::{
     keyboard::{Key, Modifiers, key::Named},
     widget::{
         Column, Row, button, checkbox, column, container, horizontal_rule, horizontal_space,
-        pick_list, row, scrollable, stack, text, text_input, vertical_rule,
+        pick_list, rich_text, row, scrollable, span, stack, text, text_input, vertical_rule,
     },
 };
 use rusty_alto::LanguageCardinality;
@@ -376,14 +376,12 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
         Message::PreviousDerivation => {
             if let Some(language) = state.active_language_mut() {
                 language.derivation_index = language.derivation_index.saturating_sub(1);
-                language.output_index = 0;
             }
         }
         Message::NextDerivation => {
             if let Some(language) = state.active_language_mut() {
                 if language.derivation_index + 1 < language.derivations.len() {
                     language.derivation_index += 1;
-                    language.output_index = 0;
                 } else if language.has_next() {
                     if let Some(worker) = &language.worker {
                         worker.request(language.derivation_index + 1);
@@ -451,7 +449,6 @@ fn poll_language(language: &mut LanguageSession) {
                 }
                 if index == language.derivation_index + 1 {
                     language.derivation_index = index;
-                    language.output_index = 0;
                 }
             }
             LanguageEvent::EndOfLanguage(count) => {
@@ -622,6 +619,7 @@ fn view_bar<'a>(
     active_tab: DocumentTab,
     language_ready: bool,
     extra: Option<Element<'a, Message>>,
+    divider: bool,
 ) -> Element<'a, Message> {
     let mut bar = row![view_selector(primary_label, active_tab, language_ready)]
         .align_y(Alignment::Center)
@@ -629,9 +627,13 @@ fn view_bar<'a>(
     if let Some(extra) = extra {
         bar = bar.push(extra);
     }
-    column![bar, horizontal_rule(1).style(theme::separator)]
-        .spacing(8)
-        .into()
+    if divider {
+        column![bar, horizontal_rule(1).style(theme::separator)]
+            .spacing(8)
+            .into()
+    } else {
+        bar.into()
+    }
 }
 
 /// Prominent two-segment toggle for the primary Grammar/Chart ↔ Language switch.
@@ -716,8 +718,13 @@ fn grammar_page(state: &Workbench) -> Element<'_, Message> {
                     grammar.summary.maximum_rank
                 ),
             ),
-            view_bar("Grammar", DocumentTab::Primary, ready, None),
-            rule_table(&grammar.rules, Message::SortGrammar),
+            view_bar("Grammar", DocumentTab::Primary, ready, None, true),
+            rule_table(
+                &grammar.rules,
+                &grammar.interpretation_names,
+                false,
+                Message::SortGrammar,
+            ),
         ]
         .spacing(theme::SECTION_SPACING),
     )
@@ -736,10 +743,10 @@ fn chart_page(parse: &ParseSession) -> Element<'_, Message> {
                     parse.chart.elapsed
                 ),
             ),
-            view_bar("Chart", DocumentTab::Primary, parse.language.ready(), None),
-            rule_table(&parse.chart.rules, move |column| Message::SortChart(
-                id, column
-            )),
+            view_bar("Chart", DocumentTab::Primary, parse.language.ready(), None, true),
+            rule_table(&parse.chart.rules, &[], true, move |column| {
+                Message::SortChart(id, column)
+            }),
         ]
         .spacing(theme::SECTION_SPACING),
     )
@@ -878,34 +885,31 @@ fn language_page<'a>(
             } else {
                 scrollable(
                     container(text(&output.value).size(16))
-                        .padding(20)
+                        .padding(16)
                         .width(Length::Fill),
                 )
                 .into()
             };
-            let content = if let Some(term) = &output.term {
-                column![
-                    value,
-                    container(
-                        column![
-                            text("TERM").size(10).color(theme::MUTED),
-                            text(term).size(13),
-                        ]
-                        .spacing(4)
-                    )
-                    .padding(12)
-                    .width(Length::Fill)
-                    .style(theme::flat),
-                ]
-                .height(Length::Fill)
-            } else {
-                column![value].height(Length::Fill)
-            };
-            let body = container(content)
+            let body: Element<'a, Message> = if let Some(term) = &output.term {
+                container(
+                    column![
+                        panel_section("Value", value, 3),
+                        horizontal_rule(1).style(theme::separator),
+                        panel_section("Term", tree_view(term.clone(), language.zoom), 2),
+                    ]
+                    .height(Length::Fill),
+                )
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .style(theme::raised)
-                .into();
+                .into()
+            } else {
+                container(value)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(theme::raised)
+                    .into()
+            };
 
             let previous = button(text("‹").size(18)).style(theme::quiet_button);
             let previous = if language.derivation_index > 0 {
@@ -976,11 +980,27 @@ fn language_page<'a>(
     page(
         column![
             heading,
-            view_bar(primary_label, DocumentTab::Language, true, extra),
+            view_bar(primary_label, DocumentTab::Language, true, extra, false),
             body,
         ]
         .spacing(theme::SECTION_SPACING),
     )
+}
+
+/// A labeled section ("Value" / "Term") inside the language content panel.
+fn panel_section<'a>(
+    title: &'a str,
+    body: Element<'a, Message>,
+    portion: u16,
+) -> Element<'a, Message> {
+    column![
+        text(title.to_uppercase()).size(10).color(theme::MUTED),
+        container(body).width(Length::Fill).height(Length::Fill),
+    ]
+    .spacing(6)
+    .padding([10, 14])
+    .height(Length::FillPortion(portion))
+    .into()
 }
 
 /// A centered status message filling the content panel (loading / error / empty).
@@ -1023,50 +1043,56 @@ fn status_bar(state: &Workbench) -> Element<'_, Message> {
 
 fn rule_table<'a>(
     rows: &'a [RuleRow],
+    interpretations: &'a [String],
+    mute_spans: bool,
     sort: impl Fn(RuleColumn) -> Message + Copy + 'a,
 ) -> Element<'a, Message> {
-    let header = row![
-        table_header("State", 2, RuleColumn::State, sort),
-        table_header("Rule", 4, RuleColumn::Rule, sort),
-        table_header("Weight", 1, RuleColumn::Weight, sort),
-        table_header("Interpretations", 5, RuleColumn::Interpretations, sort),
+    let rule_portion = if interpretations.is_empty() { 9 } else { 6 };
+    const WEIGHT_PORTION: u16 = 1;
+    const INTERP_PORTION: u16 = 3;
+
+    let mut header = row![
+        table_header("Rule", rule_portion, RuleColumn::Rule, sort),
+        table_header("Weight", WEIGHT_PORTION, RuleColumn::Weight, sort),
     ]
-    .spacing(8)
-    .padding([0, 8])
+    .spacing(12)
+    .padding([0, 10])
     .align_y(Alignment::Center);
+    for name in interpretations {
+        header = header.push(
+            container(text(name).size(11).color(theme::MUTED))
+                .width(Length::FillPortion(INTERP_PORTION)),
+        );
+    }
+
     let mut body = Column::new().spacing(0);
     for (index, item) in rows.iter().enumerate() {
+        let mut cells = row![
+            container(rule_cell(&item.parent, &item.rhs, mute_spans))
+                .width(Length::FillPortion(rule_portion)),
+            table_cell_owned(format_weight(item.weight), WEIGHT_PORTION),
+        ]
+        .spacing(12)
+        .padding([0, 10])
+        .align_y(Alignment::Center);
+        for column in 0..interpretations.len() {
+            let term = item.interpretations.get(column).map(String::as_str).unwrap_or("");
+            cells = cells.push(table_cell(term, INTERP_PORTION));
+        }
         body = body.push(
-            container(
-                row![
-                    table_cell(&item.parent, 2),
-                    table_cell(&item.rhs, 4),
-                    table_cell_owned(format!("[{}]", item.weight), 1),
-                    table_cell(&item.terms, 5),
-                ]
-                .spacing(8)
-                .padding([0, 8])
-                .align_y(Alignment::Center),
-            )
-            .center_y(theme::TABLE_ROW_HEIGHT)
-            .width(Length::Fill)
-            .style(move |_| iced::widget::container::Style {
-                background: Some(
-                    if index % 2 == 0 {
-                        theme::BG
-                    } else {
-                        theme::SURFACE
-                    }
-                    .into(),
-                ),
-                text_color: Some(theme::TEXT),
-                ..Default::default()
-            }),
+            container(cells)
+                .center_y(theme::TABLE_ROW_HEIGHT)
+                .width(Length::Fill)
+                .style(move |_| iced::widget::container::Style {
+                    background: Some(if index % 2 == 0 { theme::BG } else { theme::SURFACE }.into()),
+                    text_color: Some(theme::TEXT),
+                    ..Default::default()
+                }),
         );
     }
     container(column![
         container(header)
-            .center_y(32)
+            .center_y(34)
             .width(Length::Fill)
             .style(theme::raised),
         scrollable(body).height(Length::Fill),
@@ -1075,6 +1101,52 @@ fn rule_table<'a>(
     .height(Length::Fill)
     .style(theme::panel)
     .into()
+}
+
+/// "parent → rhs" for a rule. On the chart, the `[i,j]` position spans are
+/// muted so the rule structure stands out.
+fn rule_cell<'a>(parent: &str, rhs: &str, mute_spans: bool) -> Element<'a, Message> {
+    let full = format!("{parent}  →  {rhs}");
+    if !mute_spans {
+        return text(full).size(12).into();
+    }
+    let mut spans = Vec::new();
+    let mut buf = String::new();
+    let mut buf_muted = false;
+    let mut depth: u32 = 0;
+    for ch in full.chars() {
+        let muted = match ch {
+            '[' => {
+                depth += 1;
+                true
+            }
+            ']' => {
+                let was = depth > 0;
+                depth = depth.saturating_sub(1);
+                was
+            }
+            _ => depth > 0,
+        };
+        if !buf.is_empty() && muted != buf_muted {
+            let color = if buf_muted { theme::MUTED } else { theme::TEXT };
+            spans.push(span(std::mem::take(&mut buf)).color(color));
+        }
+        buf_muted = muted;
+        buf.push(ch);
+    }
+    if !buf.is_empty() {
+        let color = if buf_muted { theme::MUTED } else { theme::TEXT };
+        spans.push(span(buf).color(color));
+    }
+    rich_text(spans).size(12).into()
+}
+
+fn format_weight(weight: f64) -> String {
+    if weight.fract() == 0.0 {
+        format!("{}", weight as i64)
+    } else {
+        format!("{weight:.4}")
+    }
 }
 
 fn table_header<'a>(
@@ -1202,10 +1274,8 @@ fn parse_label(inputs: &[(String, String)]) -> String {
 
 fn sort_rows(rows: &mut [RuleRow], column: RuleColumn) {
     rows.sort_by(|a, b| match column {
-        RuleColumn::State => a.parent.cmp(&b.parent),
-        RuleColumn::Rule => a.rhs.cmp(&b.rhs),
+        RuleColumn::Rule => a.parent.cmp(&b.parent).then_with(|| a.rhs.cmp(&b.rhs)),
         RuleColumn::Weight => a.weight.total_cmp(&b.weight),
-        RuleColumn::Interpretations => a.terms.cmp(&b.terms),
     });
 }
 

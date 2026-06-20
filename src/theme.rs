@@ -12,7 +12,6 @@ pub const BG: Color = Color::from_rgb(0.965, 0.971, 0.980);
 pub const CANVAS: Color = Color::from_rgb(0.985, 0.988, 0.994);
 pub const SIDEBAR: Color = Color::from_rgb(0.925, 0.941, 0.961);
 pub const SURFACE: Color = Color::WHITE;
-pub const SURFACE_RAISED: Color = Color::from_rgb(0.975, 0.980, 0.989);
 pub const HOVER: Color = Color::from_rgb(0.875, 0.910, 0.955);
 pub const BORDER: Color = Color::from_rgb(0.745, 0.790, 0.845);
 pub const TEXT: Color = Color::from_rgb(0.125, 0.155, 0.200);

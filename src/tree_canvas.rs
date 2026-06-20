@@ -62,21 +62,16 @@ impl<Message> canvas::Program<Message, Theme, Renderer> for TreeScene {
                 offset_x + (node.x - node.width / 2.0) * scale,
                 offset_y + node.y * scale,
             );
-            frame.fill_rectangle(top_left, Size::new(width, height), theme::SURFACE_RAISED);
-            let border = canvas::Path::rectangle(top_left, Size::new(width, height));
-            frame.stroke(
-                &border,
-                canvas::Stroke::default()
-                    .with_color(theme::ACCENT)
-                    .with_width(1.0),
-            );
+            // No box: just mask the label area with the panel colour so the
+            // edges stop short of the text instead of running into it.
+            frame.fill_rectangle(top_left, Size::new(width, height), theme::SURFACE);
             frame.fill_text(canvas::Text {
                 content: node.label.clone(),
                 position: Point::new(top_left.x + width / 2.0, top_left.y + height / 2.0),
                 color: theme::TEXT,
                 size: Pixels::from((13.0 * scale).clamp(9.0, 20.0)),
                 line_height: text::LineHeight::default(),
-                font: Font::DEFAULT,
+                font: Font::with_name("Inter"),
                 horizontal_alignment: alignment::Horizontal::Center,
                 vertical_alignment: alignment::Vertical::Center,
                 shaping: text::Shaping::Basic,
