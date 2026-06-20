@@ -11,8 +11,8 @@ use iced::{
     Alignment, Element, Length, Subscription, Task,
     keyboard::{Key, Modifiers, key::Named},
     widget::{
-        Column, Row, button, checkbox, column, container, horizontal_space, pick_list, row,
-        scrollable, text, text_input, vertical_rule,
+        Column, Row, button, checkbox, column, container, horizontal_rule, horizontal_space,
+        pick_list, row, scrollable, stack, text, text_input, vertical_rule,
     },
 };
 use rusty_alto::LanguageCardinality;
@@ -25,6 +25,7 @@ use std::{
 pub fn run() -> iced::Result {
     iced::application("Rusty Alto Workbench", update, view)
         .theme(theme::app_theme)
+        .default_font(iced::Font::with_name("Helvetica Neue"))
         .subscription(subscription)
         .window(iced::window::Settings {
             size: iced::Size::new(1440.0, 900.0),
@@ -477,7 +478,12 @@ fn view(state: &Workbench) -> Element<'_, Message> {
     let body = row![
         sidebar(state),
         vertical_rule(1),
-        column![context_tabs(state), workspace(state)].width(Length::Fill),
+        column![
+            context_tabs(state),
+            horizontal_rule(1).style(theme::separator),
+            workspace(state),
+        ]
+        .width(Length::Fill),
     ]
     .height(Length::Fill);
 
@@ -526,9 +532,13 @@ fn sidebar(state: &Workbench) -> Element<'_, Message> {
     for parse in &state.parses {
         let id = parse.id;
         let content = column![
-            text(format!("#{}  {}", parse.id, parse.label))
-                .size(12)
-                .wrapping(text::Wrapping::None),
+            container(
+                text(format!("#{}  {}", parse.id, parse.label))
+                    .size(12)
+                    .wrapping(text::Wrapping::None),
+            )
+            .clip(true)
+            .width(Length::Fill),
             text(parse.language.sidebar_status())
                 .size(10)
                 .color(match parse.language.status {
@@ -536,26 +546,32 @@ fn sidebar(state: &Workbench) -> Element<'_, Message> {
                     _ => theme::MUTED,
                 }),
         ]
-        .spacing(3);
+        .spacing(3)
+        .padding(iced::Padding {
+            top: 0.0,
+            right: 22.0,
+            bottom: 0.0,
+            left: 0.0,
+        });
         let select = document_button(
             content,
             state.selection == Selection::Parse(id),
             Message::SelectParse(id),
         );
-        let remove = button(text("×").size(15))
-            .padding([6, 9])
-            .style(theme::quiet_button)
-            .on_press(Message::RemoveParse(id));
-        documents = documents.push(
-            row![select, remove]
-                .spacing(3)
-                .align_y(Alignment::Center)
-                .width(Length::Fill),
-        );
+        let remove = container(
+            button(text("×").size(14))
+                .padding([1, 7])
+                .style(theme::quiet_button)
+                .on_press(Message::RemoveParse(id)),
+        )
+        .align_right(Length::Fill)
+        .center_y(Length::Fill)
+        .padding([0, 6]);
+        documents = documents.push(stack![select, remove]);
     }
 
     let parse_button = button(text("+ Parse").size(13))
-        .width(170)
+        .width(Length::Fill)
         .padding([10, 18])
         .style(theme::parse_button);
     let parse_button = if state.grammar.is_some() && state.busy.is_none() {
@@ -566,16 +582,13 @@ fn sidebar(state: &Workbench) -> Element<'_, Message> {
 
     container(
         column![
+            scrollable(documents.padding([12, 0])).height(Length::Fill),
+            parse_button,
             button(text("Open grammar…").size(13))
                 .width(Length::Fill)
                 .padding([9, 12])
                 .style(button::secondary)
                 .on_press(Message::OpenGrammar),
-            scrollable(documents.padding([12, 0])).height(Length::Fill),
-            container(parse_button)
-                .padding([10, 18])
-                .width(Length::Fill)
-                .center_x(Length::Fill),
         ]
         .padding([12, 10])
         .spacing(8)
@@ -606,57 +619,121 @@ fn document_button<'a>(
 
 fn context_tabs(state: &Workbench) -> Element<'_, Message> {
     if state.selection == Selection::NewParse || state.grammar.is_none() {
-        return container(horizontal_space())
-            .height(theme::TAB_HEIGHT + 16.0)
-            .width(Length::Fill)
-            .style(theme::tab_strip)
-            .into();
+        return bar_shell(horizontal_space().into());
     }
     let primary_label = match state.selection {
         Selection::Grammar => "Grammar",
         Selection::Parse(_) => "Chart",
         Selection::NewParse => unreachable!(),
     };
-    let primary = button(text(primary_label).size(12))
-        .height(theme::TAB_HEIGHT)
-        .padding([0, 15])
-        .style(if state.active_tab == DocumentTab::Primary {
-            theme::selected_button
-        } else {
-            theme::quiet_button
+    let ready = state.active_language().is_some_and(LanguageSession::ready);
+
+    let mut bar = row![view_selector(primary_label, state.active_tab, ready)]
+        .align_y(Alignment::Center);
+    if state.active_tab == DocumentTab::Language {
+        if let Some(controls) = interpretation_controls(state) {
+            bar = bar
+                .push(horizontal_space().width(theme::SELECTOR_GAP))
+                .push(controls);
+        }
+    }
+    bar_shell(bar.into())
+}
+
+/// The chrome around the merged top bar: fixed height, gutters, background.
+fn bar_shell(content: Element<'_, Message>) -> Element<'_, Message> {
+    container(content)
+        .center_y(theme::TAB_BAR_HEIGHT)
+        .width(Length::Fill)
+        .padding(iced::Padding {
+            top: 0.0,
+            right: theme::BAR_PADDING_X,
+            bottom: 0.0,
+            left: theme::BAR_PADDING_X,
         })
+        .style(theme::tab_strip)
+        .into()
+}
+
+/// Prominent two-segment toggle for the primary Grammar/Chart ↔ Language switch.
+fn view_selector<'a>(
+    primary_label: &'a str,
+    active_tab: DocumentTab,
+    language_ready: bool,
+) -> Element<'a, Message> {
+    const R: f32 = 6.0;
+    let primary = button(text(primary_label).size(13))
+        .padding([7, 16])
+        .style(theme::segment(active_tab == DocumentTab::Primary, [R, 0.0, 0.0, R]))
         .on_press(Message::SelectTab(DocumentTab::Primary));
 
-    let ready = state.active_language().is_some_and(LanguageSession::ready);
-    let language_text =
-        text("Language")
-            .size(12)
-            .color(if ready { theme::TEXT } else { theme::MUTED });
-    let language = button(language_text)
-        .height(theme::TAB_HEIGHT)
-        .padding([0, 15])
-        .style(if ready && state.active_tab == DocumentTab::Language {
-            theme::selected_button
-        } else {
-            theme::quiet_button
-        });
-    let language = if ready {
+    let language_active = language_ready && active_tab == DocumentTab::Language;
+    let language = button(text("Language").size(13))
+        .padding([7, 16])
+        .style(theme::segment(language_active, [0.0, R, R, 0.0]));
+    let language = if language_ready {
         language.on_press(Message::SelectTab(DocumentTab::Language))
     } else {
         language
     };
 
-    container(row![primary, language].spacing(4).align_y(Alignment::End))
-        .padding(iced::Padding {
-            top: 10.0,
-            right: 18.0,
-            bottom: 0.0,
-            left: 18.0,
-        })
-        .height(theme::TAB_HEIGHT + 16.0)
-        .width(Length::Fill)
-        .style(theme::tab_strip)
-        .into()
+    row![primary, language].into()
+}
+
+/// Interpretation-view tabs + zoom controls, shown on the Language view.
+fn interpretation_controls(state: &Workbench) -> Option<Element<'_, Message>> {
+    let language = state.active_language()?;
+    let derivation = language.derivations.get(language.derivation_index)?;
+    let output_index = language
+        .output_index
+        .min(derivation.views.len().saturating_sub(1));
+
+    let mut tabs = Row::new().spacing(6).align_y(Alignment::Center);
+    for (index, item) in derivation.views.iter().enumerate() {
+        tabs = tabs.push(interpretation_tab(
+            &item.name,
+            index == output_index,
+            Message::SelectOutput(index),
+        ));
+    }
+
+    let zoom = row![
+        button(text("−").size(15))
+            .style(theme::quiet_button)
+            .on_press(Message::ZoomOut),
+        button(text(format!("{}%", (language.zoom * 100.0).round() as i32)).size(12))
+            .style(theme::quiet_button)
+            .on_press(Message::ZoomReset),
+        button(text("+").size(15))
+            .style(theme::quiet_button)
+            .on_press(Message::ZoomIn),
+    ]
+    .spacing(2)
+    .align_y(Alignment::Center);
+
+    Some(
+        row![tabs, horizontal_space(), zoom]
+            .width(Length::Fill)
+            .align_y(Alignment::Center)
+            .into(),
+    )
+}
+
+/// One interpretation tab: a quiet text label with an accent underline when active.
+fn interpretation_tab<'a>(label: &'a str, active: bool, msg: Message) -> Element<'a, Message> {
+    column![
+        button(text(label).size(12).color(if active { theme::TEXT } else { theme::MUTED }))
+            .padding([4, 8])
+            .style(theme::quiet_button)
+            .on_press(msg),
+        container(horizontal_space())
+            .height(theme::UNDERLINE)
+            .width(Length::Fill)
+            .style(theme::underline(active)),
+    ]
+    .spacing(4)
+    .align_x(Alignment::Center)
+    .into()
 }
 
 fn workspace(state: &Workbench) -> Element<'_, Message> {
@@ -673,7 +750,7 @@ fn workspace(state: &Workbench) -> Element<'_, Message> {
                         state
                             .grammar
                             .as_ref()
-                            .map(|grammar| display_name(&grammar.path))
+                            .map(|grammar| format!("Grammar: {}", display_name(&grammar.path)))
                             .unwrap_or_else(|| "Grammar".into()),
                     )
                 })
@@ -704,7 +781,7 @@ fn grammar_page(state: &Workbench) -> Element<'_, Message> {
     page(
         column![
             page_heading(
-                "Grammar rules",
+                format!("Grammar: {}", display_name(&grammar.path)),
                 format!(
                     "{} rules · {} states · maximum rank {}",
                     grammar.summary.rule_count,
@@ -841,19 +918,6 @@ fn language_page(language: &LanguageSession, title: String) -> Element<'_, Messa
         .output_index
         .min(derivation.views.len().saturating_sub(1));
     let output = &derivation.views[output_index];
-    let mut choices = Row::new().spacing(4);
-    for (index, item) in derivation.views.iter().enumerate() {
-        choices = choices.push(
-            button(text(&item.name).size(12))
-                .padding([7, 10])
-                .style(if index == output_index {
-                    theme::selected_button
-                } else {
-                    theme::quiet_button
-                })
-                .on_press(Message::SelectOutput(index)),
-        );
-    }
     let value: Element<'_, Message> = if let Some(layout) = &output.tree {
         tree_view(layout.clone(), language.zoom)
     } else {
@@ -894,43 +958,25 @@ fn language_page(language: &LanguageSession, title: String) -> Element<'_, Messa
     } else {
         next
     };
+    let heading = row![
+        page_heading(
+            title,
+            format!(
+                "#{} of {} · weight {:.6}",
+                language.derivation_index + 1,
+                language.size_label(),
+                derivation.weight
+            ),
+        ),
+        horizontal_space(),
+        previous,
+        next,
+    ]
+    .align_y(Alignment::Center)
+    .spacing(5);
     page(
         column![
-            column![
-                text(title).size(19),
-                row![
-                    text(format!(
-                        "#{} of {} · weight {:.6}",
-                        language.derivation_index + 1,
-                        language.size_label(),
-                        derivation.weight
-                    ))
-                    .size(12)
-                    .color(theme::MUTED),
-                    horizontal_space(),
-                    previous,
-                    next,
-                ]
-                .align_y(Alignment::Center)
-                .spacing(5),
-            ]
-            .spacing(4),
-            row![
-                scrollable(choices).direction(scrollable::Direction::Horizontal(
-                    scrollable::Scrollbar::default()
-                )),
-                horizontal_space(),
-                button(text("−"))
-                    .style(theme::quiet_button)
-                    .on_press(Message::ZoomOut),
-                button(text(format!("{}%", (language.zoom * 100.0).round() as i32)))
-                    .style(theme::quiet_button)
-                    .on_press(Message::ZoomReset),
-                button(text("+"))
-                    .style(theme::quiet_button)
-                    .on_press(Message::ZoomIn),
-            ]
-            .align_y(Alignment::Center),
+            heading,
             container(content)
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -987,7 +1033,7 @@ fn rule_table<'a>(
                 .padding([0, 8])
                 .align_y(Alignment::Center),
             )
-            .height(theme::TABLE_ROW_HEIGHT)
+            .center_y(theme::TABLE_ROW_HEIGHT)
             .width(Length::Fill)
             .style(move |_| iced::widget::container::Style {
                 background: Some(
@@ -1005,7 +1051,7 @@ fn rule_table<'a>(
     }
     container(column![
         container(header)
-            .height(32)
+            .center_y(32)
             .width(Length::Fill)
             .style(theme::raised),
         scrollable(body).height(Length::Fill),

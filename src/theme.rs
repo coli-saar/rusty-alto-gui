@@ -1,13 +1,21 @@
 use iced::{
     Border, Color, Shadow, Theme,
-    widget::{button, container},
+    widget::{button, container, rule},
 };
 
 pub const SIDEBAR_WIDTH: f32 = 280.0;
 pub const PAGE_PADDING: f32 = 18.0;
 pub const SECTION_SPACING: f32 = 12.0;
 pub const TABLE_ROW_HEIGHT: f32 = 28.0;
-pub const TAB_HEIGHT: f32 = 38.0;
+
+/// Height of the single merged top bar (view selector + interpretation tabs).
+pub const TAB_BAR_HEIGHT: f32 = 46.0;
+/// Horizontal padding inside the top bar and matching content gutters.
+pub const BAR_PADDING_X: f32 = 18.0;
+/// Gap separating the primary view selector from the interpretation tabs.
+pub const SELECTOR_GAP: f32 = 28.0;
+/// Thickness of the active interpretation-tab underline.
+pub const UNDERLINE: f32 = 2.0;
 
 pub const BG: Color = Color::from_rgb(0.965, 0.971, 0.980);
 pub const CANVAS: Color = Color::from_rgb(0.985, 0.988, 0.994);
@@ -134,4 +142,57 @@ pub fn parse_button(theme: &Theme, status: button::Status) -> button::Style {
     style.text_color = Color::WHITE;
     style.border.radius = 6.0.into();
     style
+}
+
+/// A 1px separator line, used under the top bar.
+pub fn separator(_: &Theme) -> rule::Style {
+    rule::Style {
+        color: BORDER,
+        width: 1,
+        radius: 0.0.into(),
+        fill_mode: rule::FillMode::Full,
+    }
+}
+
+/// One segment of the primary view selector. `corners` rounds only the outer
+/// edge so the two segments read as a single joined toggle.
+pub fn segment(active: bool, corners: [f32; 4]) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme: &Theme, status: button::Status| {
+        let mut style = button::secondary(theme, status);
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        style.background = Some(
+            if active {
+                if hovered { HOVER } else { ACCENT_SOFT }
+            } else if hovered {
+                HOVER
+            } else {
+                Color::TRANSPARENT
+            }
+            .into(),
+        );
+        style.text_color = match status {
+            button::Status::Disabled => MUTED,
+            _ if active => TEXT,
+            _ => MUTED,
+        };
+        style.border = Border {
+            color: if active { ACCENT } else { BORDER },
+            width: 1.0,
+            radius: iced::border::Radius {
+                top_left: corners[0],
+                top_right: corners[1],
+                bottom_right: corners[2],
+                bottom_left: corners[3],
+            },
+        };
+        style
+    }
+}
+
+/// The thin underline beneath the active interpretation tab.
+pub fn underline(active: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_: &Theme| container::Style {
+        background: Some(if active { ACCENT } else { Color::TRANSPARENT }.into()),
+        ..container::Style::default()
+    }
 }
