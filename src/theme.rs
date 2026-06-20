@@ -6,7 +6,7 @@ use iced::{
 pub const SIDEBAR_WIDTH: f32 = 280.0;
 pub const PAGE_PADDING: f32 = 18.0;
 pub const SECTION_SPACING: f32 = 12.0;
-pub const TABLE_ROW_HEIGHT: f32 = 28.0;
+pub const TABLE_ROW_HEIGHT: f32 = 34.0;
 
 pub const BG: Color = Color::from_rgb(0.965, 0.971, 0.980);
 pub const CANVAS: Color = Color::from_rgb(0.985, 0.988, 0.994);

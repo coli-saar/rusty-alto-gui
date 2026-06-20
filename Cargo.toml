@@ -12,6 +12,13 @@ packed-term-arena = "0.1.0"
 rfd = "0.17.2"
 rusty-alto = { path = "../../rusty-alto" }
 
+# Native menu bar. A top-of-screen menu bar is a macOS concept (and iced 0.13
+# doesn't expose the per-window handles Windows/Linux menus need), so this is
+# macOS-only for now. muda is a cross-platform menu crate, so extending to other
+# platforms later means adding the dep + an init call rather than a rewrite.
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = "0.15"
+
 # `cargo bundle` packages a "Rusty Alto.app" whose CFBundleName drives the
 # macOS menu-bar application name. See the macOS notes in the source.
 [package.metadata.bundle]

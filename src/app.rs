@@ -56,6 +56,11 @@ fn window_settings() -> window::Settings {
 #[derive(Default)]
 struct App {
     windows: BTreeMap<window::Id, Workbench>,
+    #[cfg(target_os = "macos")]
+    menu_installed: bool,
+    /// Last window to gain focus — the target for app-level menu actions.
+    #[cfg(target_os = "macos")]
+    focused: Option<window::Id>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +72,10 @@ enum AppMsg {
     GrammarPicked(window::Id, Option<PathBuf>),
     GrammarLoaded(window::Id, Result<GrammarDocument, String>),
     Poll,
+    #[cfg(target_os = "macos")]
+    WindowFocused(window::Id),
+    #[cfg(target_os = "macos")]
+    MenuPoll,
 }
 
 fn app_title(app: &App, id: window::Id) -> String {
@@ -78,7 +87,7 @@ fn app_title(app: &App, id: window::Id) -> String {
 
 fn window_title(state: &Workbench) -> String {
     match &state.grammar {
-        Some(grammar) => format!("Rusty Alto: {}", display_name(&grammar.path)),
+        Some(grammar) => display_name(&grammar.path),
         None => "Rusty Alto".to_owned(),
     }
 }
@@ -138,7 +147,16 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
             }
             Task::none()
         }
-        AppMsg::WindowOpened(id) => window::gain_focus(id),
+        AppMsg::WindowOpened(id) => {
+            // Install the native menu bar once, now that NSApp is running on the
+            // main thread (this update runs on the winit/main thread).
+            #[cfg(target_os = "macos")]
+            if !app.menu_installed {
+                app.menu_installed = true;
+                macos_menu::install();
+            }
+            window::gain_focus(id)
+        }
         AppMsg::CloseWindow(id) => {
             app.windows.remove(&id);
             if app.windows.is_empty() {
@@ -153,6 +171,35 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
             }
             Task::none()
         }
+        #[cfg(target_os = "macos")]
+        AppMsg::WindowFocused(id) => {
+            app.focused = Some(id);
+            Task::none()
+        }
+        #[cfg(target_os = "macos")]
+        AppMsg::MenuPoll => {
+            let mut tasks = Vec::new();
+            while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
+                match event.id.0.as_str() {
+                    macos_menu::OPEN_GRAMMAR_ID => {
+                        // Open into the focused window (its handler decides
+                        // whether to reuse the window or spawn a new one).
+                        let target = app
+                            .focused
+                            .or_else(|| app.windows.keys().next().copied());
+                        if let Some(id) = target {
+                            tasks.push(app_update(app, AppMsg::Window(id, Message::OpenGrammar)));
+                        }
+                    }
+                    macos_menu::CLOSE_ALL_ID => {
+                        app.windows.clear();
+                        tasks.push(iced::exit());
+                    }
+                    _ => {}
+                }
+            }
+            Task::batch(tasks)
+        }
     }
 }
 
@@ -163,15 +210,115 @@ fn app_subscription(app: &App) -> Subscription<AppMsg> {
     } else {
         Subscription::none()
     };
-    // Route keyboard shortcuts to whichever window currently has focus.
-    let keyboard = event::listen_with(|event, _status, id| match event {
+    // Route keyboard shortcuts to whichever window currently has focus, and
+    // remember the focused window for app-level menu actions (macOS).
+    let events = event::listen_with(|event, _status, id| match event {
         Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
             keyboard_shortcut(key, modifiers).map(|message| AppMsg::Window(id, message))
         }
+        #[cfg(target_os = "macos")]
+        Event::Window(window::Event::Focused) => Some(AppMsg::WindowFocused(id)),
         _ => None,
     });
     let closes = window::close_requests().map(AppMsg::CloseWindow);
-    Subscription::batch([polling, keyboard, closes])
+    let mut subscriptions = vec![polling, events, closes];
+    // Drain native menu activations (Open grammar / Close All Windows).
+    #[cfg(target_os = "macos")]
+    subscriptions.push(iced::time::every(Duration::from_millis(120)).map(|_| AppMsg::MenuPoll));
+    Subscription::batch(subscriptions)
+}
+
+/// Native macOS menu bar via muda. The predefined items (Quit, Hide, Minimize,
+/// and the auto-populated window list) are handled by AppKit itself, so no menu
+/// events need routing back into iced. A top-of-screen menu bar is a macOS
+/// concept; the muda API is cross-platform, so adding Windows/Linux later is an
+/// extra init call rather than a rewrite.
+#[cfg(target_os = "macos")]
+mod macos_menu {
+    use muda::{
+        AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu,
+        accelerator::{Accelerator, Code, Modifiers},
+    };
+
+    pub const OPEN_GRAMMAR_ID: &str = "open-grammar";
+    pub const CLOSE_ALL_ID: &str = "close-all";
+    const APP_NAME: &str = "Rusty Alto";
+
+    pub fn install() {
+        let menu = Menu::new();
+
+        // The application menu (its bold name comes from the process name).
+        let app_menu = Submenu::new(APP_NAME, true);
+        let about = PredefinedMenuItem::about(
+            Some(&format!("About {APP_NAME}")),
+            Some(AboutMetadata {
+                name: Some(APP_NAME.to_owned()),
+                ..Default::default()
+            }),
+        );
+        let hide = PredefinedMenuItem::hide(Some(&format!("Hide {APP_NAME}")));
+        let quit = PredefinedMenuItem::quit(Some(&format!("Quit {APP_NAME}")));
+        let _ = app_menu.append_items(&[
+            &about,
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::services(None),
+            &PredefinedMenuItem::separator(),
+            &hide,
+            &PredefinedMenuItem::hide_others(None),
+            &PredefinedMenuItem::show_all(None),
+            &PredefinedMenuItem::separator(),
+            &quit,
+        ]);
+
+        // File: custom items routed back through muda's event channel; Close
+        // Window is the native ⌘W item.
+        let file_menu = Submenu::new("File", true);
+        let open_grammar = MenuItem::with_id(OPEN_GRAMMAR_ID, "Open grammar…", true, None);
+        let close_all = MenuItem::with_id(
+            CLOSE_ALL_ID,
+            "Close All Windows",
+            true,
+            Some(Accelerator::new(
+                Some(Modifiers::SUPER | Modifiers::SHIFT),
+                Code::KeyW,
+            )),
+        );
+        let _ = file_menu.append_items(&[
+            &open_grammar,
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::close_window(None),
+            &close_all,
+        ]);
+
+        // Edit: standard items handled natively by AppKit.
+        let edit_menu = Submenu::new("Edit", true);
+        let _ = edit_menu.append_items(&[
+            &PredefinedMenuItem::undo(None),
+            &PredefinedMenuItem::redo(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::cut(None),
+            &PredefinedMenuItem::copy(None),
+            &PredefinedMenuItem::paste(None),
+            &PredefinedMenuItem::select_all(None),
+        ]);
+
+        // Window: AppKit auto-populates this with the open windows.
+        let window_menu = Submenu::new("Window", true);
+        let _ = window_menu.append_items(&[
+            &PredefinedMenuItem::minimize(None),
+            &PredefinedMenuItem::maximize(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::bring_all_to_front(None),
+        ]);
+
+        let _ = menu.append_items(&[&app_menu, &file_menu, &edit_menu, &window_menu]);
+        menu.init_for_nsapp();
+        window_menu.set_as_windows_menu_for_nsapp();
+
+        // AppKit retains the NSMenu, but keep muda's wrappers alive for the
+        // process lifetime so the menu isn't torn down.
+        std::mem::forget(menu);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -643,11 +790,6 @@ fn sidebar(state: &Workbench) -> Element<'_, Message> {
         column![
             scrollable(documents.padding([12, 0])).height(Length::Fill),
             parse_button,
-            button(text("Open grammar…").size(13))
-                .width(Length::Fill)
-                .padding([9, 12])
-                .style(button::secondary)
-                .on_press(Message::OpenGrammar),
         ]
         .padding([12, 10])
         .spacing(8)
@@ -684,7 +826,6 @@ fn view_bar<'a>(
     active_tab: DocumentTab,
     language_ready: bool,
     extra: Option<Element<'a, Message>>,
-    divider: bool,
 ) -> Element<'a, Message> {
     let mut bar = row![view_selector(primary_label, active_tab, language_ready)]
         .align_y(Alignment::Center)
@@ -692,13 +833,7 @@ fn view_bar<'a>(
     if let Some(extra) = extra {
         bar = bar.push(extra);
     }
-    if divider {
-        column![bar, horizontal_rule(1).style(theme::separator)]
-            .spacing(8)
-            .into()
-    } else {
-        bar.into()
-    }
+    bar.into()
 }
 
 /// Prominent two-segment toggle for the primary Grammar/Chart ↔ Language switch.
@@ -792,7 +927,7 @@ fn grammar_page(state: &Workbench) -> Element<'_, Message> {
                     grammar.summary.maximum_rank
                 ),
             ),
-            view_bar("Grammar", DocumentTab::Primary, ready, None, true),
+            view_bar("Grammar", DocumentTab::Primary, ready, None),
             rule_table(
                 &grammar.rules,
                 &grammar.interpretation_names,
@@ -817,7 +952,7 @@ fn chart_page(parse: &ParseSession) -> Element<'_, Message> {
                     parse.chart.elapsed
                 ),
             ),
-            view_bar("Chart", DocumentTab::Primary, parse.language.ready(), None, true),
+            view_bar("Chart", DocumentTab::Primary, parse.language.ready(), None),
             rule_table(&parse.chart.rules, &[], true, move |column| {
                 Message::SortChart(id, column)
             }),
@@ -1061,7 +1196,7 @@ fn language_page<'a>(
     page(
         column![
             heading,
-            view_bar(primary_label, DocumentTab::Language, true, extra, false),
+            view_bar(primary_label, DocumentTab::Language, true, extra),
             body,
         ]
         .spacing(theme::SECTION_SPACING),
@@ -1117,9 +1252,9 @@ fn status_bar(state: &Workbench) -> Element<'_, Message> {
         row![text(marker).size(10).color(color), text(status).size(11)]
             .align_y(Alignment::Center)
             .spacing(7)
-            .padding([0, 10]),
+            .padding([0, 12]),
     )
-    .height(24)
+    .center_y(26)
     .width(Length::Fill)
     .style(theme::flat)
     .into()
@@ -1144,7 +1279,7 @@ fn rule_table<'a>(
     .align_y(Alignment::Center);
     for name in interpretations {
         header = header.push(
-            container(text(name).size(11).color(theme::MUTED))
+            container(text(name).size(12).color(theme::MUTED))
                 .width(Length::FillPortion(INTERP_PORTION)),
         );
     }
@@ -1178,11 +1313,19 @@ fn rule_table<'a>(
         container(header)
             .center_y(34)
             .width(Length::Fill)
-            .style(theme::raised),
+            .style(|_| iced::widget::container::Style {
+                background: Some(theme::SURFACE.into()),
+                ..Default::default()
+            }),
+        horizontal_rule(1).style(theme::separator),
         scrollable(body).height(Length::Fill),
     ])
     .width(Length::Fill)
     .height(Length::Fill)
+    // Inset content past the 1px border and clip to the rounded corners so the
+    // zebra rows don't paint over the panel edge.
+    .padding(1)
+    .clip(true)
     .style(theme::panel)
     .into()
 }
@@ -1192,7 +1335,7 @@ fn rule_table<'a>(
 fn rule_cell<'a>(parent: &str, rhs: &str, mute_spans: bool) -> Element<'a, Message> {
     let full = format!("{parent}  →  {rhs}");
     if !mute_spans {
-        return text(full).size(12).into();
+        return text(full).size(14).into();
     }
     let mut spans = Vec::new();
     let mut buf = String::new();
@@ -1222,7 +1365,7 @@ fn rule_cell<'a>(parent: &str, rhs: &str, mute_spans: bool) -> Element<'a, Messa
         let color = if buf_muted { theme::MUTED } else { theme::TEXT };
         spans.push(span(buf).color(color));
     }
-    rich_text(spans).size(12).into()
+    rich_text(spans).size(14).into()
 }
 
 fn format_weight(weight: f64) -> String {
@@ -1239,7 +1382,7 @@ fn table_header<'a>(
     column: RuleColumn,
     sort: impl Fn(RuleColumn) -> Message + Copy + 'a,
 ) -> Element<'a, Message> {
-    button(text(format!("{label}  ↕")).size(11).color(theme::MUTED))
+    button(text(format!("{label}  ↕")).size(12).color(theme::MUTED))
         .width(Length::FillPortion(width))
         .padding(0)
         .style(theme::quiet_button)
@@ -1248,20 +1391,27 @@ fn table_header<'a>(
 }
 
 fn table_cell<'a>(value: &'a str, width: u16) -> Element<'a, Message> {
-    container(text(value).size(12))
+    container(text(value).size(14))
         .width(Length::FillPortion(width))
         .into()
 }
 
 fn table_cell_owned(value: String, width: u16) -> Element<'static, Message> {
-    container(text(value).size(12))
+    container(text(value).size(14))
         .width(Length::FillPortion(width))
         .into()
 }
 
 fn page<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     container(content)
-        .padding(theme::PAGE_PADDING)
+        // Smaller bottom inset so the panel bottom lines up with the sidebar's
+        // "+ Parse" button and sits closer to the status bar.
+        .padding(iced::Padding {
+            top: theme::PAGE_PADDING,
+            right: theme::PAGE_PADDING,
+            bottom: 12.0,
+            left: theme::PAGE_PADDING,
+        })
         .width(Length::Fill)
         .height(Length::Fill)
         .style(theme::workspace)
