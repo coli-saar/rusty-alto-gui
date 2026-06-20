@@ -25,7 +25,14 @@ use std::{
 pub fn run() -> iced::Result {
     iced::application("Rusty Alto Workbench", update, view)
         .theme(theme::app_theme)
-        .default_font(iced::Font::with_name("Helvetica Neue"))
+        .font(include_bytes!("../assets/fonts/Inter-Regular.ttf").as_slice())
+        .font(include_bytes!("../assets/fonts/Inter-Medium.ttf").as_slice())
+        .font(include_bytes!("../assets/fonts/Inter-SemiBold.ttf").as_slice())
+        .default_font(iced::Font {
+            family: iced::font::Family::Name("Inter"),
+            weight: iced::font::Weight::Medium,
+            ..iced::Font::DEFAULT
+        })
         .subscription(subscription)
         .window(iced::window::Settings {
             size: iced::Size::new(1440.0, 900.0),
@@ -475,17 +482,7 @@ fn subscription(state: &Workbench) -> Subscription<Message> {
 }
 
 fn view(state: &Workbench) -> Element<'_, Message> {
-    let body = row![
-        sidebar(state),
-        vertical_rule(1),
-        column![
-            context_tabs(state),
-            horizontal_rule(1).style(theme::separator),
-            workspace(state),
-        ]
-        .width(Length::Fill),
-    ]
-    .height(Length::Fill);
+    let body = row![sidebar(state), vertical_rule(1), workspace(state)].height(Length::Fill);
 
     container(column![body, status_bar(state)])
         .width(Length::Fill)
@@ -617,41 +614,23 @@ fn document_button<'a>(
         .into()
 }
 
-fn context_tabs(state: &Workbench) -> Element<'_, Message> {
-    if state.selection == Selection::NewParse || state.grammar.is_none() {
-        return bar_shell(horizontal_space().into());
+/// The merged view bar: the primary selector on the left plus, on the Language
+/// view, the interpretation tabs and zoom controls. Sits below the page heading
+/// and directly above the content it controls, with a baseline rule.
+fn view_bar<'a>(
+    primary_label: &'a str,
+    active_tab: DocumentTab,
+    language_ready: bool,
+    extra: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let mut bar = row![view_selector(primary_label, active_tab, language_ready)]
+        .align_y(Alignment::Center)
+        .spacing(24);
+    if let Some(extra) = extra {
+        bar = bar.push(extra);
     }
-    let primary_label = match state.selection {
-        Selection::Grammar => "Grammar",
-        Selection::Parse(_) => "Chart",
-        Selection::NewParse => unreachable!(),
-    };
-    let ready = state.active_language().is_some_and(LanguageSession::ready);
-
-    let mut bar = row![view_selector(primary_label, state.active_tab, ready)]
-        .align_y(Alignment::Center);
-    if state.active_tab == DocumentTab::Language {
-        if let Some(controls) = interpretation_controls(state) {
-            bar = bar
-                .push(horizontal_space().width(theme::SELECTOR_GAP))
-                .push(controls);
-        }
-    }
-    bar_shell(bar.into())
-}
-
-/// The chrome around the merged top bar: fixed height, gutters, background.
-fn bar_shell(content: Element<'_, Message>) -> Element<'_, Message> {
-    container(content)
-        .center_y(theme::TAB_BAR_HEIGHT)
-        .width(Length::Fill)
-        .padding(iced::Padding {
-            top: 0.0,
-            right: theme::BAR_PADDING_X,
-            bottom: 0.0,
-            left: theme::BAR_PADDING_X,
-        })
-        .style(theme::tab_strip)
+    column![bar, horizontal_rule(1).style(theme::separator)]
+        .spacing(8)
         .into()
 }
 
@@ -680,62 +659,6 @@ fn view_selector<'a>(
     row![primary, language].into()
 }
 
-/// Interpretation-view tabs + zoom controls, shown on the Language view.
-fn interpretation_controls(state: &Workbench) -> Option<Element<'_, Message>> {
-    let language = state.active_language()?;
-    let derivation = language.derivations.get(language.derivation_index)?;
-    let output_index = language
-        .output_index
-        .min(derivation.views.len().saturating_sub(1));
-
-    let mut tabs = Row::new().spacing(6).align_y(Alignment::Center);
-    for (index, item) in derivation.views.iter().enumerate() {
-        tabs = tabs.push(interpretation_tab(
-            &item.name,
-            index == output_index,
-            Message::SelectOutput(index),
-        ));
-    }
-
-    let zoom = row![
-        button(text("−").size(15))
-            .style(theme::quiet_button)
-            .on_press(Message::ZoomOut),
-        button(text(format!("{}%", (language.zoom * 100.0).round() as i32)).size(12))
-            .style(theme::quiet_button)
-            .on_press(Message::ZoomReset),
-        button(text("+").size(15))
-            .style(theme::quiet_button)
-            .on_press(Message::ZoomIn),
-    ]
-    .spacing(2)
-    .align_y(Alignment::Center);
-
-    Some(
-        row![tabs, horizontal_space(), zoom]
-            .width(Length::Fill)
-            .align_y(Alignment::Center)
-            .into(),
-    )
-}
-
-/// One interpretation tab: a quiet text label with an accent underline when active.
-fn interpretation_tab<'a>(label: &'a str, active: bool, msg: Message) -> Element<'a, Message> {
-    column![
-        button(text(label).size(12).color(if active { theme::TEXT } else { theme::MUTED }))
-            .padding([4, 8])
-            .style(theme::quiet_button)
-            .on_press(msg),
-        container(horizontal_space())
-            .height(theme::UNDERLINE)
-            .width(Length::Fill)
-            .style(theme::underline(active)),
-    ]
-    .spacing(4)
-    .align_x(Alignment::Center)
-    .into()
-}
-
 fn workspace(state: &Workbench) -> Element<'_, Message> {
     match state.selection {
         Selection::NewParse => parse_page(state),
@@ -752,6 +675,7 @@ fn workspace(state: &Workbench) -> Element<'_, Message> {
                             .as_ref()
                             .map(|grammar| format!("Grammar: {}", display_name(&grammar.path)))
                             .unwrap_or_else(|| "Grammar".into()),
+                        "Grammar",
                     )
                 })
                 .unwrap_or_else(|| empty_state("No language", "Open a grammar first.", None)),
@@ -762,9 +686,11 @@ fn workspace(state: &Workbench) -> Element<'_, Message> {
             };
             match state.active_tab {
                 DocumentTab::Primary => chart_page(parse),
-                DocumentTab::Language => {
-                    language_page(&parse.language, format!("#{}  {}", parse.id, parse.label))
-                }
+                DocumentTab::Language => language_page(
+                    &parse.language,
+                    format!("#{}  {}", parse.id, parse.label),
+                    "Chart",
+                ),
             }
         }
     }
@@ -778,6 +704,7 @@ fn grammar_page(state: &Workbench) -> Element<'_, Message> {
             Some(("Open grammar…", Message::OpenGrammar)),
         );
     };
+    let ready = state.active_language().is_some_and(LanguageSession::ready);
     page(
         column![
             page_heading(
@@ -789,6 +716,7 @@ fn grammar_page(state: &Workbench) -> Element<'_, Message> {
                     grammar.summary.maximum_rank
                 ),
             ),
+            view_bar("Grammar", DocumentTab::Primary, ready, None),
             rule_table(&grammar.rules, Message::SortGrammar),
         ]
         .spacing(theme::SECTION_SPACING),
@@ -808,6 +736,7 @@ fn chart_page(parse: &ParseSession) -> Element<'_, Message> {
                     parse.chart.elapsed
                 ),
             ),
+            view_bar("Chart", DocumentTab::Primary, parse.language.ready(), None),
             rule_table(&parse.chart.rules, move |column| Message::SortChart(
                 id, column
             )),
@@ -886,104 +815,190 @@ fn parse_page(state: &Workbench) -> Element<'_, Message> {
     )
 }
 
-fn language_page(language: &LanguageSession, title: String) -> Element<'_, Message> {
-    match &language.status {
-        LanguageStatus::Preparing => {
-            return empty_state(
+fn language_page<'a>(
+    language: &'a LanguageSession,
+    title: String,
+    primary_label: &'a str,
+) -> Element<'a, Message> {
+    let derivation = match &language.status {
+        LanguageStatus::Ready(LanguageCardinality::Finite(0)) => None,
+        LanguageStatus::Ready(_) => language.derivations.get(language.derivation_index),
+        _ => None,
+    };
+
+    // Each state resolves to a subtitle, optional derivation nav, optional
+    // interpretation toolbar (tabs + zoom), and the body panel.
+    type Bits<'b> = (
+        String,
+        Option<Element<'b, Message>>,
+        Option<Element<'b, Message>>,
+        Element<'b, Message>,
+    );
+    let (subtitle, nav, extra, body): Bits<'a> = match (&language.status, derivation) {
+        (LanguageStatus::Preparing, _) => (
+            "Preparing…".into(),
+            None,
+            None,
+            message_panel(
                 "Preparing language…",
                 "Initializing the sorted language iterator in the background.",
-                None,
-            );
-        }
-        LanguageStatus::Error(error) => {
-            return empty_state("Could not prepare language", error, None);
-        }
-        LanguageStatus::Ready(LanguageCardinality::Finite(0)) => {
-            return empty_state(
-                "Language is empty",
-                "This automaton accepts no derivation trees.",
-                None,
-            );
-        }
-        LanguageStatus::Ready(_) => {}
-    }
-    let Some(derivation) = language.derivations.get(language.derivation_index) else {
-        return empty_state(
-            "Loading first derivation…",
-            "Evaluating interpretations and preparing the derivation tree.",
-            None,
-        );
-    };
-    let output_index = language
-        .output_index
-        .min(derivation.views.len().saturating_sub(1));
-    let output = &derivation.views[output_index];
-    let value: Element<'_, Message> = if let Some(layout) = &output.tree {
-        tree_view(layout.clone(), language.zoom)
-    } else {
-        scrollable(
-            container(text(&output.value).size(16))
-                .padding(20)
-                .width(Length::Fill),
-        )
-        .into()
-    };
-    let content = if let Some(term) = &output.term {
-        column![
-            value,
-            container(
-                column![
-                    text("TERM").size(10).color(theme::MUTED),
-                    text(term).size(13),
-                ]
-                .spacing(4)
-            )
-            .padding(12)
-            .width(Length::Fill)
-            .style(theme::flat),
-        ]
-        .height(Length::Fill)
-    } else {
-        column![value].height(Length::Fill)
-    };
-    let previous = button(text("‹").size(18)).style(theme::quiet_button);
-    let previous = if language.derivation_index > 0 {
-        previous.on_press(Message::PreviousDerivation)
-    } else {
-        previous
-    };
-    let next = button(text("›").size(18)).style(theme::quiet_button);
-    let next = if language.has_next() {
-        next.on_press(Message::NextDerivation)
-    } else {
-        next
-    };
-    let heading = row![
-        page_heading(
-            title,
-            format!(
-                "#{} of {} · weight {:.6}",
-                language.derivation_index + 1,
-                language.size_label(),
-                derivation.weight
             ),
         ),
-        horizontal_space(),
-        previous,
-        next,
-    ]
-    .align_y(Alignment::Center)
-    .spacing(5);
+        (LanguageStatus::Error(error), _) => (
+            "Could not prepare".into(),
+            None,
+            None,
+            message_panel("Could not prepare language", error),
+        ),
+        (LanguageStatus::Ready(LanguageCardinality::Finite(0)), _) => (
+            "Empty language".into(),
+            None,
+            None,
+            message_panel(
+                "Language is empty",
+                "This automaton accepts no derivation trees.",
+            ),
+        ),
+        (LanguageStatus::Ready(_), None) => (
+            "Loading…".into(),
+            None,
+            None,
+            message_panel(
+                "Loading first derivation…",
+                "Evaluating interpretations and preparing the derivation tree.",
+            ),
+        ),
+        (LanguageStatus::Ready(_), Some(derivation)) => {
+            let output_index = language
+                .output_index
+                .min(derivation.views.len().saturating_sub(1));
+            let output = &derivation.views[output_index];
+            let value: Element<'a, Message> = if let Some(layout) = &output.tree {
+                tree_view(layout.clone(), language.zoom)
+            } else {
+                scrollable(
+                    container(text(&output.value).size(16))
+                        .padding(20)
+                        .width(Length::Fill),
+                )
+                .into()
+            };
+            let content = if let Some(term) = &output.term {
+                column![
+                    value,
+                    container(
+                        column![
+                            text("TERM").size(10).color(theme::MUTED),
+                            text(term).size(13),
+                        ]
+                        .spacing(4)
+                    )
+                    .padding(12)
+                    .width(Length::Fill)
+                    .style(theme::flat),
+                ]
+                .height(Length::Fill)
+            } else {
+                column![value].height(Length::Fill)
+            };
+            let body = container(content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(theme::raised)
+                .into();
+
+            let previous = button(text("‹").size(18)).style(theme::quiet_button);
+            let previous = if language.derivation_index > 0 {
+                previous.on_press(Message::PreviousDerivation)
+            } else {
+                previous
+            };
+            let next = button(text("›").size(18)).style(theme::quiet_button);
+            let next = if language.has_next() {
+                next.on_press(Message::NextDerivation)
+            } else {
+                next
+            };
+            let nav = row![previous, next].align_y(Alignment::Center).spacing(2);
+
+            // Interpretation-view tabs sit in the bar, right above the tree.
+            let mut tabs = Row::new().spacing(4).align_y(Alignment::Center);
+            for (index, item) in derivation.views.iter().enumerate() {
+                tabs = tabs.push(
+                    button(text(&item.name).size(12))
+                        .padding([6, 12])
+                        .style(if index == output_index {
+                            theme::selected_button
+                        } else {
+                            theme::quiet_button
+                        })
+                        .on_press(Message::SelectOutput(index)),
+                );
+            }
+            let zoom = row![
+                button(text("−").size(15))
+                    .style(theme::quiet_button)
+                    .on_press(Message::ZoomOut),
+                button(text(format!("{}%", (language.zoom * 100.0).round() as i32)).size(12))
+                    .style(theme::quiet_button)
+                    .on_press(Message::ZoomReset),
+                button(text("+").size(15))
+                    .style(theme::quiet_button)
+                    .on_press(Message::ZoomIn),
+            ]
+            .spacing(2)
+            .align_y(Alignment::Center);
+            let extra = row![tabs, horizontal_space(), zoom]
+                .width(Length::Fill)
+                .align_y(Alignment::Center);
+
+            (
+                format!(
+                    "#{} of {} · weight {:.6}",
+                    language.derivation_index + 1,
+                    language.size_label(),
+                    derivation.weight
+                ),
+                Some(nav.into()),
+                Some(extra.into()),
+                body,
+            )
+        }
+    };
+
+    let mut heading = row![page_heading(title, subtitle), horizontal_space()]
+        .align_y(Alignment::Center)
+        .spacing(5);
+    if let Some(nav) = nav {
+        heading = heading.push(nav);
+    }
+
     page(
         column![
             heading,
-            container(content)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(theme::raised),
+            view_bar(primary_label, DocumentTab::Language, true, extra),
+            body,
         ]
         .spacing(theme::SECTION_SPACING),
     )
+}
+
+/// A centered status message filling the content panel (loading / error / empty).
+fn message_panel<'a>(title: &'a str, detail: &'a str) -> Element<'a, Message> {
+    container(
+        column![
+            text(title).size(18),
+            text(detail).size(13).color(theme::MUTED),
+        ]
+        .align_x(Alignment::Center)
+        .spacing(8),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .center_x(Length::Fill)
+    .center_y(Length::Fill)
+    .style(theme::raised)
+    .into()
 }
 
 fn status_bar(state: &Workbench) -> Element<'_, Message> {

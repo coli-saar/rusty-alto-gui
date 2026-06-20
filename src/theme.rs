@@ -8,15 +8,6 @@ pub const PAGE_PADDING: f32 = 18.0;
 pub const SECTION_SPACING: f32 = 12.0;
 pub const TABLE_ROW_HEIGHT: f32 = 28.0;
 
-/// Height of the single merged top bar (view selector + interpretation tabs).
-pub const TAB_BAR_HEIGHT: f32 = 46.0;
-/// Horizontal padding inside the top bar and matching content gutters.
-pub const BAR_PADDING_X: f32 = 18.0;
-/// Gap separating the primary view selector from the interpretation tabs.
-pub const SELECTOR_GAP: f32 = 28.0;
-/// Thickness of the active interpretation-tab underline.
-pub const UNDERLINE: f32 = 2.0;
-
 pub const BG: Color = Color::from_rgb(0.965, 0.971, 0.980);
 pub const CANVAS: Color = Color::from_rgb(0.985, 0.988, 0.994);
 pub const SIDEBAR: Color = Color::from_rgb(0.925, 0.941, 0.961);
@@ -80,19 +71,6 @@ pub fn sidebar(_: &Theme) -> container::Style {
 pub fn workspace(_: &Theme) -> container::Style {
     container::Style {
         background: Some(CANVAS.into()),
-        text_color: Some(TEXT),
-        ..container::Style::default()
-    }
-}
-
-pub fn tab_strip(_: &Theme) -> container::Style {
-    container::Style {
-        background: Some(BG.into()),
-        border: Border {
-            color: BORDER,
-            width: 0.0,
-            radius: 0.0.into(),
-        },
         text_color: Some(TEXT),
         ..container::Style::default()
     }
@@ -186,13 +164,5 @@ pub fn segment(active: bool, corners: [f32; 4]) -> impl Fn(&Theme, button::Statu
             },
         };
         style
-    }
-}
-
-/// The thin underline beneath the active interpretation tab.
-pub fn underline(active: bool) -> impl Fn(&Theme) -> container::Style {
-    move |_: &Theme| container::Style {
-        background: Some(if active { ACCENT } else { Color::TRANSPARENT }.into()),
-        ..container::Style::default()
     }
 }
