@@ -21,10 +21,6 @@ pub const ACCENT_SOFT: Color = Color::from_rgb(0.830, 0.900, 0.980);
 pub const SUCCESS: Color = Color::from_rgb(0.180, 0.600, 0.365);
 pub const DANGER: Color = Color::from_rgb(0.790, 0.220, 0.250);
 
-pub fn app_theme(_: &crate::app::Workbench) -> Theme {
-    Theme::Light
-}
-
 pub fn panel(_: &Theme) -> container::Style {
     container::Style {
         background: Some(SURFACE.into()),

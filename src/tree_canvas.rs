@@ -1,7 +1,7 @@
 use crate::{model::TreeLayout, theme};
 use iced::{
     Element, Font, Length, Pixels, Point, Rectangle, Renderer, Size, Theme, alignment, mouse,
-    widget::{canvas, text},
+    widget::{canvas, scrollable, text},
 };
 use std::sync::Arc;
 
@@ -9,10 +9,23 @@ pub fn tree_view<Message: 'static>(
     layout: Arc<TreeLayout>,
     zoom: f32,
 ) -> Element<'static, Message> {
-    canvas(TreeScene { layout, zoom })
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+    let scale = zoom.max(0.35);
+    // Size the canvas to the tree's natural extent (plus a little padding) so
+    // the scrollable can pan a tree that's wider or taller than the viewport.
+    let width = layout.width * scale + 24.0;
+    let height = layout.height * scale + 36.0;
+    scrollable(
+        canvas(TreeScene { layout, zoom })
+            .width(Length::Fixed(width))
+            .height(Length::Fixed(height)),
+    )
+    .direction(scrollable::Direction::Both {
+        vertical: scrollable::Scrollbar::default(),
+        horizontal: scrollable::Scrollbar::default(),
+    })
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 
 struct TreeScene {

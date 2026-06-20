@@ -12,3 +12,11 @@ packed-term-arena = "0.1.0"
 rfd = "0.17.2"
 rusty-alto = { path = "../../rusty-alto" }
 
+# `cargo bundle` packages a "Rusty Alto.app" whose CFBundleName drives the
+# macOS menu-bar application name. See the macOS notes in the source.
+[package.metadata.bundle]
+name = "Rusty Alto"
+identifier = "org.rustyalto.workbench"
+short_description = "A single-window Iced workbench for rusty-alto"
+category = "public.app-category.developer-tools"
+

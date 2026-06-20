@@ -8,23 +8,25 @@ use crate::{
     workers::{self, LanguageEvent, LanguageWorker},
 };
 use iced::{
-    Alignment, Element, Length, Subscription, Task,
+    Alignment, Element, Event, Length, Subscription, Task, event,
     keyboard::{Key, Modifiers, key::Named},
     widget::{
         Column, Row, button, checkbox, column, container, horizontal_rule, horizontal_space,
         pick_list, rich_text, row, scrollable, span, stack, text, text_input, vertical_rule,
     },
+    window,
 };
 use rusty_alto::LanguageCardinality;
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, mpsc},
     time::Duration,
 };
 
 pub fn run() -> iced::Result {
-    iced::application("Rusty Alto Workbench", update, view)
-        .theme(theme::app_theme)
+    iced::daemon(app_title, app_update, app_view)
+        .theme(|_app, _id| iced::Theme::Light)
         .font(include_bytes!("../assets/fonts/Inter-Regular.ttf").as_slice())
         .font(include_bytes!("../assets/fonts/Inter-Medium.ttf").as_slice())
         .font(include_bytes!("../assets/fonts/Inter-SemiBold.ttf").as_slice())
@@ -33,20 +35,148 @@ pub fn run() -> iced::Result {
             weight: iced::font::Weight::Medium,
             ..iced::Font::DEFAULT
         })
-        .subscription(subscription)
-        .window(iced::window::Settings {
-            size: iced::Size::new(1440.0, 900.0),
-            min_size: Some(iced::Size::new(1050.0, 680.0)),
-            ..Default::default()
+        .subscription(app_subscription)
+        .run_with(|| {
+            let mut app = App::default();
+            let (id, open) = window::open(window_settings());
+            app.windows.insert(id, Workbench::default());
+            (app, open.map(AppMsg::WindowOpened))
         })
-        .run_with(|| (Workbench::default(), Task::none()))
+}
+
+fn window_settings() -> window::Settings {
+    window::Settings {
+        size: iced::Size::new(1440.0, 900.0),
+        min_size: Some(iced::Size::new(1050.0, 680.0)),
+        ..Default::default()
+    }
+}
+
+/// Top-level daemon state: one [`Workbench`] per open grammar window.
+#[derive(Default)]
+struct App {
+    windows: BTreeMap<window::Id, Workbench>,
+}
+
+#[derive(Debug, Clone)]
+enum AppMsg {
+    /// A message originating from a specific window's view/shortcuts.
+    Window(window::Id, Message),
+    WindowOpened(window::Id),
+    CloseWindow(window::Id),
+    GrammarPicked(window::Id, Option<PathBuf>),
+    GrammarLoaded(window::Id, Result<GrammarDocument, String>),
+    Poll,
+}
+
+fn app_title(app: &App, id: window::Id) -> String {
+    app.windows
+        .get(&id)
+        .map(window_title)
+        .unwrap_or_else(|| "Rusty Alto".to_owned())
+}
+
+fn window_title(state: &Workbench) -> String {
+    match &state.grammar {
+        Some(grammar) => format!("Rusty Alto: {}", display_name(&grammar.path)),
+        None => "Rusty Alto".to_owned(),
+    }
+}
+
+fn app_view(app: &App, id: window::Id) -> Element<'_, AppMsg> {
+    match app.windows.get(&id) {
+        Some(window) => view(window).map(move |message| AppMsg::Window(id, message)),
+        None => horizontal_space().into(),
+    }
+}
+
+fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
+    match message {
+        // Opening a grammar is an app-level action: it may spawn a new window.
+        AppMsg::Window(id, Message::OpenGrammar | Message::ShortcutOpenGrammar) => Task::perform(
+            async {
+                rfd::AsyncFileDialog::new()
+                    .add_filter("IRTG grammar", &["irtg"])
+                    .pick_file()
+                    .await
+                    .map(|handle| handle.path().to_owned())
+            },
+            move |path| AppMsg::GrammarPicked(id, path),
+        ),
+        AppMsg::Window(id, message) => match app.windows.get_mut(&id) {
+            Some(window) => update(window, message).map(move |m| AppMsg::Window(id, m)),
+            None => Task::none(),
+        },
+        AppMsg::GrammarPicked(_, None) => Task::none(),
+        AppMsg::GrammarPicked(asking_id, Some(path)) => {
+            // Load into the asking window if it's still empty, otherwise open a
+            // fresh window so every grammar gets its own window.
+            let needs_new_window = app
+                .windows
+                .get(&asking_id)
+                .is_none_or(|window| window.grammar.is_some());
+            let (target, open_task) = if needs_new_window {
+                let (new_id, open) = window::open(window_settings());
+                app.windows.insert(new_id, Workbench::default());
+                (new_id, open.map(AppMsg::WindowOpened))
+            } else {
+                (asking_id, Task::none())
+            };
+            if let Some(window) = app.windows.get_mut(&target) {
+                window.busy = Some(format!("Loading {}…", display_name(&path)));
+                window.error = None;
+            }
+            let load = Task::perform(
+                async move { workers::load_grammar(path) },
+                move |result| AppMsg::GrammarLoaded(target, result),
+            );
+            Task::batch([open_task, load])
+        }
+        AppMsg::GrammarLoaded(id, result) => {
+            if let Some(window) = app.windows.get_mut(&id) {
+                window.apply_grammar(result);
+            }
+            Task::none()
+        }
+        AppMsg::WindowOpened(id) => window::gain_focus(id),
+        AppMsg::CloseWindow(id) => {
+            app.windows.remove(&id);
+            if app.windows.is_empty() {
+                iced::exit()
+            } else {
+                window::close(id)
+            }
+        }
+        AppMsg::Poll => {
+            for window in app.windows.values_mut() {
+                window.poll();
+            }
+            Task::none()
+        }
+    }
+}
+
+fn app_subscription(app: &App) -> Subscription<AppMsg> {
+    let needs_poll = app.windows.values().any(Workbench::has_pending_language);
+    let polling = if needs_poll {
+        iced::time::every(Duration::from_millis(80)).map(|_| AppMsg::Poll)
+    } else {
+        Subscription::none()
+    };
+    // Route keyboard shortcuts to whichever window currently has focus.
+    let keyboard = event::listen_with(|event, _status, id| match event {
+        Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+            keyboard_shortcut(key, modifiers).map(|message| AppMsg::Window(id, message))
+        }
+        _ => None,
+    });
+    let closes = window::close_requests().map(AppMsg::CloseWindow);
+    Subscription::batch([polling, keyboard, closes])
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     OpenGrammar,
-    GrammarPicked(Option<PathBuf>),
-    GrammarLoaded(Result<GrammarDocument, String>),
     SelectGrammar,
     SelectParse(u64),
     RemoveParse(u64),
@@ -60,7 +190,6 @@ pub enum Message {
     BeamChanged(String),
     Parse,
     Parsed(Result<ChartDocument, String>),
-    PollLanguages,
     PreviousDerivation,
     NextDerivation,
     SelectOutput(usize),
@@ -194,46 +323,8 @@ impl LanguageSession {
 
 fn update(state: &mut Workbench, message: Message) -> Task<Message> {
     match message {
-        Message::OpenGrammar => {
-            return Task::perform(
-                async {
-                    rfd::AsyncFileDialog::new()
-                        .add_filter("IRTG grammar", &["irtg"])
-                        .pick_file()
-                        .await
-                        .map(|handle| handle.path().to_owned())
-                },
-                Message::GrammarPicked,
-            );
-        }
-        Message::GrammarPicked(Some(path)) => {
-            state.busy = Some(format!("Loading {}…", display_name(&path)));
-            state.error = None;
-            return Task::perform(
-                async move { workers::load_grammar(path) },
-                Message::GrammarLoaded,
-            );
-        }
-        Message::GrammarPicked(None) => {}
-        Message::GrammarLoaded(result) => {
-            state.busy = None;
-            match result {
-                Ok(document) => {
-                    let (sender, receiver) = mpsc::channel();
-                    let worker =
-                        workers::start_grammar_language_worker(document.grammar.clone(), sender);
-                    state.inputs = input_fields(&document);
-                    state.grammar = Some(document);
-                    state.grammar_language = Some(LanguageSession::preparing(worker, receiver));
-                    state.parses.clear();
-                    state.next_parse_id = 1;
-                    state.selection = Selection::Grammar;
-                    state.active_tab = DocumentTab::Primary;
-                    state.error = None;
-                }
-                Err(error) => state.fail(format!("Could not load grammar: {error}")),
-            }
-        }
+        // Opening a grammar is handled at the app level (it may open a window).
+        Message::OpenGrammar | Message::ShortcutOpenGrammar => {}
         Message::SelectGrammar => {
             if state.grammar.is_some() {
                 state.selection = Selection::Grammar;
@@ -365,14 +456,6 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
                 }
             }
         }
-        Message::PollLanguages => {
-            if let Some(language) = &mut state.grammar_language {
-                poll_language(language);
-            }
-            for parse in &mut state.parses {
-                poll_language(&mut parse.language);
-            }
-        }
         Message::PreviousDerivation => {
             if let Some(language) = state.active_language_mut() {
                 language.derivation_index = language.derivation_index.saturating_sub(1);
@@ -409,7 +492,6 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
                 language.zoom = 1.0;
             }
         }
-        Message::ShortcutOpenGrammar => return update(state, Message::OpenGrammar),
         Message::ShortcutPrevious => {
             if state.active_tab == DocumentTab::Language {
                 return update(state, Message::PreviousDerivation);
@@ -459,23 +541,6 @@ fn poll_language(language: &mut LanguageSession) {
             }
         }
     }
-}
-
-fn subscription(state: &Workbench) -> Subscription<Message> {
-    let has_language = state
-        .grammar_language
-        .as_ref()
-        .is_some_and(|language| language.receiver.is_some())
-        || state
-            .parses
-            .iter()
-            .any(|parse| parse.language.receiver.is_some());
-    let polling = if has_language {
-        iced::time::every(Duration::from_millis(80)).map(|_| Message::PollLanguages)
-    } else {
-        Subscription::none()
-    };
-    Subscription::batch([polling, iced::keyboard::on_key_press(keyboard_shortcut)])
 }
 
 fn view(state: &Workbench) -> Element<'_, Message> {
@@ -643,14 +708,23 @@ fn view_selector<'a>(
     language_ready: bool,
 ) -> Element<'a, Message> {
     const R: f32 = 6.0;
-    let primary = button(text(primary_label).size(13))
-        .padding([7, 16])
+    const SEGMENT_WIDTH: f32 = 104.0;
+    let segment_label = |label: &str| {
+        text(label.to_owned())
+            .size(13)
+            .width(Length::Fill)
+            .align_x(Alignment::Center)
+    };
+    let primary = button(segment_label(primary_label))
+        .width(Length::Fixed(SEGMENT_WIDTH))
+        .padding([7, 10])
         .style(theme::segment(active_tab == DocumentTab::Primary, [R, 0.0, 0.0, R]))
         .on_press(Message::SelectTab(DocumentTab::Primary));
 
     let language_active = language_ready && active_tab == DocumentTab::Language;
-    let language = button(text("Language").size(13))
-        .padding([7, 16])
+    let language = button(segment_label("Language"))
+        .width(Length::Fixed(SEGMENT_WIDTH))
+        .padding([7, 10])
         .style(theme::segment(language_active, [0.0, R, R, 0.0]));
     let language = if language_ready {
         language.on_press(Message::SelectTab(DocumentTab::Language))
@@ -755,15 +829,15 @@ fn chart_page(parse: &ParseSession) -> Element<'_, Message> {
 fn parse_page(state: &Workbench) -> Element<'_, Message> {
     let mut fields = Column::new().spacing(10);
     for (index, input) in state.inputs.iter().enumerate() {
+        let mut field = text_input("Optional interpretation input", &input.value)
+            .on_input(move |value| Message::InputChanged(index, value))
+            .padding(9)
+            .size(13);
+        if state.busy.is_none() {
+            field = field.on_submit(Message::Parse);
+        }
         fields = fields.push(
-            column![
-                text(&input.name).size(12).color(theme::MUTED),
-                text_input("Optional interpretation input", &input.value)
-                    .on_input(move |value| Message::InputChanged(index, value))
-                    .padding(9)
-                    .size(13),
-            ]
-            .spacing(5),
+            column![text(&input.name).size(12).color(theme::MUTED), field].spacing(5),
         );
     }
     let mut options = column![
@@ -777,17 +851,19 @@ fn parse_page(state: &Workbench) -> Element<'_, Message> {
     ]
     .spacing(6);
     if state.strategy == StrategyChoice::Astar {
+        let mut beam = text_input("Optional beam, e.g. 0.001", &state.beam)
+            .on_input(Message::BeamChanged)
+            .padding(9);
+        if state.busy.is_none() {
+            beam = beam.on_submit(Message::Parse);
+        }
         options = options
             .push(
                 checkbox("Stop after first goal", state.stop_at_first_goal)
                     .on_toggle(Message::StopAtFirstGoal)
                     .size(15),
             )
-            .push(
-                text_input("Optional beam, e.g. 0.001", &state.beam)
-                    .on_input(Message::BeamChanged)
-                    .padding(9),
-            );
+            .push(beam);
     }
     let parse_button = button(text(if state.busy.is_some() {
         "Parsing…"
@@ -880,22 +956,27 @@ fn language_page<'a>(
                 .output_index
                 .min(derivation.views.len().saturating_sub(1));
             let output = &derivation.views[output_index];
+            let value_is_tree = output.tree.is_some();
             let value: Element<'a, Message> = if let Some(layout) = &output.tree {
                 tree_view(layout.clone(), language.zoom)
             } else {
-                scrollable(
-                    container(text(&output.value).size(16))
-                        .padding(16)
-                        .width(Length::Fill),
-                )
-                .into()
+                container(text(&output.value).size(15))
+                    .width(Length::Fill)
+                    .into()
             };
             let body: Element<'a, Message> = if let Some(term) = &output.term {
+                // A string value only needs its own height; a tree value shares
+                // the panel with the term tree.
+                let (value_height, term_height) = if value_is_tree {
+                    (Length::FillPortion(3), Length::FillPortion(2))
+                } else {
+                    (Length::Shrink, Length::Fill)
+                };
                 container(
                     column![
-                        panel_section("Value", value, 3),
+                        panel_section("Value", value, value_height),
                         horizontal_rule(1).style(theme::separator),
-                        panel_section("Term", tree_view(term.clone(), language.zoom), 2),
+                        panel_section("Term", tree_view(term.clone(), language.zoom), term_height),
                     ]
                     .height(Length::Fill),
                 )
@@ -988,18 +1069,21 @@ fn language_page<'a>(
 }
 
 /// A labeled section ("Value" / "Term") inside the language content panel.
+/// The body should fill width; pass `Length::Shrink` for a content-sized
+/// section (e.g. a string value) or `Length::Fill`/`FillPortion` for a tree.
 fn panel_section<'a>(
     title: &'a str,
     body: Element<'a, Message>,
-    portion: u16,
+    height: Length,
 ) -> Element<'a, Message> {
     column![
         text(title.to_uppercase()).size(10).color(theme::MUTED),
-        container(body).width(Length::Fill).height(Length::Fill),
+        body,
     ]
     .spacing(6)
     .padding([10, 14])
-    .height(Length::FillPortion(portion))
+    .width(Length::Fill)
+    .height(height)
     .into()
 }
 
@@ -1223,6 +1307,48 @@ fn empty_state<'a>(
 }
 
 impl Workbench {
+    /// Apply a loaded grammar (or its error) to this window.
+    fn apply_grammar(&mut self, result: Result<GrammarDocument, String>) {
+        self.busy = None;
+        match result {
+            Ok(document) => {
+                let (sender, receiver) = mpsc::channel();
+                let worker =
+                    workers::start_grammar_language_worker(document.grammar.clone(), sender);
+                self.inputs = input_fields(&document);
+                self.grammar = Some(document);
+                self.grammar_language = Some(LanguageSession::preparing(worker, receiver));
+                self.parses.clear();
+                self.next_parse_id = 1;
+                self.selection = Selection::Grammar;
+                self.active_tab = DocumentTab::Primary;
+                self.error = None;
+            }
+            Err(error) => self.fail(format!("Could not load grammar: {error}")),
+        }
+    }
+
+    /// Drain background language events for this window's grammar and parses.
+    fn poll(&mut self) {
+        if let Some(language) = &mut self.grammar_language {
+            poll_language(language);
+        }
+        for parse in &mut self.parses {
+            poll_language(&mut parse.language);
+        }
+    }
+
+    /// Whether any language iterator is still feeding this window events.
+    fn has_pending_language(&self) -> bool {
+        self.grammar_language
+            .as_ref()
+            .is_some_and(|language| language.receiver.is_some())
+            || self
+                .parses
+                .iter()
+                .any(|parse| parse.language.receiver.is_some())
+    }
+
     fn parse(&self, id: u64) -> Option<&ParseSession> {
         self.parses.iter().find(|parse| parse.id == id)
     }
