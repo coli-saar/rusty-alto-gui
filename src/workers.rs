@@ -7,8 +7,8 @@ use packed_term_arena::tree::{Tree, TreeArena};
 use rusty_alto::{
     AstarHeuristic, AstarOptions, Explicit, FeatureStructure, FeatureStructureNode,
     FeatureStructureNodeId, InputCodecRegistry, Irtg, LanguageCardinality, LogProbabilityScorer,
-    MaterializationStrategy, ObligatoryLeafTables, Symbol, TreeValue, UniversalSxHeuristic,
-    VisualRepresentation,
+    MaterializationStrategy, ObligatoryLeafTables, ParseControl, Symbol, TreeValue,
+    UniversalSxHeuristic, VisualRepresentation,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -74,6 +74,7 @@ pub fn load_grammar(path: PathBuf) -> Result<GrammarDocument, String> {
     })
 }
 
+#[cfg(test)]
 pub fn parse(
     grammar: Arc<Irtg>,
     inputs: Vec<(String, String)>,
@@ -81,6 +82,26 @@ pub fn parse(
     strategy: StrategyChoice,
     heuristic: HeuristicChoice,
     stop_at_first_goal: bool,
+) -> Result<ChartDocument, String> {
+    parse_controlled(
+        grammar,
+        inputs,
+        required_valid,
+        strategy,
+        heuristic,
+        stop_at_first_goal,
+        ParseControl::new(),
+    )
+}
+
+pub fn parse_controlled(
+    grammar: Arc<Irtg>,
+    inputs: Vec<(String, String)>,
+    required_valid: Vec<String>,
+    strategy: StrategyChoice,
+    heuristic: HeuristicChoice,
+    stop_at_first_goal: bool,
+    control: ParseControl,
 ) -> Result<ChartDocument, String> {
     let start = Instant::now();
     let mut parsed = Vec::with_capacity(inputs.len());
@@ -154,13 +175,13 @@ pub fn parse(
         },
     };
     let result = grammar
-        .parse_with(parsed, &materialization)
+        .parse_with_control(parsed, &materialization, &control)
         .map_err(|error| error.to_string())?;
     let mut automaton = result.automaton;
     let mut state_names = result.state_names;
     for name in required_valid {
         let filtered = grammar
-            .filter_non_null_with_state_origins(&automaton, &name)
+            .filter_non_null_with_state_origins_controlled(&automaton, &name, &control)
             .map_err(|error| error.to_string())?;
         state_names = filtered
             .state_origins

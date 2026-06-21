@@ -6,7 +6,7 @@ use crate::{
     workers::{LanguageEvent, LanguageWorker},
 };
 use iced::Point;
-use rusty_alto::{CodecMetadata, EvaluatedAlgebraValue, LanguageCardinality};
+use rusty_alto::{CodecMetadata, EvaluatedAlgebraValue, LanguageCardinality, ParseControl};
 use std::{
     sync::{Arc, mpsc},
     time::Instant,
@@ -40,10 +40,11 @@ pub(crate) struct CopyMenu {
     pub(crate) codecs: Vec<CodecMetadata>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct ParseJob {
     pub(crate) id: u64,
     pub(crate) started: Instant,
+    pub(crate) control: ParseControl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

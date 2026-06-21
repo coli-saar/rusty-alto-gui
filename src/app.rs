@@ -472,9 +472,11 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
             state.error = None;
             let job_id = state.next_parse_job_id;
             state.next_parse_job_id += 1;
+            let control = rusty_alto::ParseControl::new();
             state.active_parse = Some(ParseJob {
                 id: job_id,
                 started: Instant::now(),
+                control: control.clone(),
             });
             let strategy = state.strategy;
             let heuristic = state.heuristic;
@@ -482,13 +484,14 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
             return Task::perform(
                 async move {
                     tokio::task::spawn_blocking(move || {
-                        workers::parse(
+                        workers::parse_controlled(
                             grammar,
                             inputs,
                             required_valid,
                             strategy,
                             heuristic,
                             stop_at_first_goal,
+                            control,
                         )
                     })
                     .await
@@ -500,11 +503,18 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
             );
         }
         Message::CancelParse => {
+            if let Some(job) = &state.active_parse {
+                job.control.cancel();
+            }
             state.active_parse = None;
             state.pending_label = None;
         }
         Message::Parsed(job_id, result) => {
-            if state.active_parse.is_none_or(|job| job.id != job_id) {
+            if state
+                .active_parse
+                .as_ref()
+                .is_none_or(|job| job.id != job_id)
+            {
                 return Task::none();
             }
             state.active_parse = None;
@@ -1175,7 +1185,7 @@ fn parse_page(state: &Workbench) -> Element<'_, Message> {
             );
         }
     }
-    let parse_button = button(text(if let Some(job) = state.active_parse {
+    let parse_button = button(text(if let Some(job) = &state.active_parse {
         format!("Cancel ({:.1}s)", job.started.elapsed().as_secs_f32())
     } else {
         "Run parser".into()
@@ -1465,7 +1475,7 @@ fn message_panel<'a>(title: &'a str, detail: &'a str) -> Element<'a, Message> {
 fn status_bar(state: &Workbench) -> Element<'_, Message> {
     let (marker, status, color) = if let Some(busy) = &state.busy {
         ("●", busy.as_str(), theme::ACCENT)
-    } else if let Some(job) = state.active_parse {
+    } else if let Some(job) = &state.active_parse {
         (
             "●",
             if job.started.elapsed() < Duration::from_secs(1) {
@@ -1964,18 +1974,21 @@ mod tests {
 
     #[test]
     fn canceled_and_stale_parse_results_are_ignored() {
+        let control = rusty_alto::ParseControl::new();
         let mut state = Workbench {
             active_parse: Some(ParseJob {
                 id: 7,
                 started: Instant::now(),
+                control: control.clone(),
             }),
             pending_label: Some("input".into()),
             ..Workbench::default()
         };
         let _ = update(&mut state, Message::Parsed(6, Err("stale".into())));
-        assert_eq!(state.active_parse.map(|job| job.id), Some(7));
+        assert_eq!(state.active_parse.as_ref().map(|job| job.id), Some(7));
         assert!(state.error.is_none());
         let _ = update(&mut state, Message::CancelParse);
+        assert!(control.is_cancelled());
         assert!(state.active_parse.is_none());
         assert!(state.pending_label.is_none());
         let _ = update(&mut state, Message::Parsed(7, Err("late".into())));
