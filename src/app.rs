@@ -1145,19 +1145,6 @@ fn parse_page(state: &Workbench) -> Element<'_, Message> {
         .width(Length::Fill),
     ]
     .spacing(6);
-    if state.strategy == StrategyChoice::Indexed
-        && state
-            .grammar
-            .as_ref()
-            .and_then(|grammar| grammar.path.extension())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("tag"))
-    {
-        options = options.push(
-            text("Indexed condensed can be extremely slow for larger TAG inputs. Top-down condensed is recommended for this grammar.")
-                .size(11)
-                .color(theme::DANGER),
-        );
-    }
     if state.strategy == StrategyChoice::Astar {
         let early_stop_supported = state.constraint_count() <= 1;
         let mut stop = checkbox(state.stop_at_first_goal)
