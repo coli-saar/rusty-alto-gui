@@ -26,6 +26,7 @@ pub enum LanguageEvent {
     Ready(LanguageCardinality),
     Derivation(Arc<DerivationPresentation>),
     EndOfLanguage(usize),
+    Failed(String),
 }
 
 #[derive(Debug)]
@@ -54,7 +55,10 @@ pub fn load_grammar(path: PathBuf) -> Result<GrammarDocument, String> {
     let grammar = Arc::new(codec.read_path(&path).map_err(|error| error.to_string())?);
     let summary = grammar.grammar().application_summary();
     let interpretations = grammar.interpretation_info();
-    let interpretation_names = interpretations.iter().map(|info| info.name.clone()).collect();
+    let interpretation_names = interpretations
+        .iter()
+        .map(|info| info.name.clone())
+        .collect();
     let rules = grammar
         .resolved_grammar_rules()
         .iter()
@@ -202,9 +206,7 @@ pub fn start_chart_language_worker(
     let (request_tx, request_rx) = mpsc::channel();
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = cancelled.clone();
-    std::thread::spawn(move || {
-        prepare_and_run_language(&grammar, &automaton, request_rx, sender, &worker_cancelled)
-    });
+    spawn_language_thread(grammar, automaton, request_rx, sender, worker_cancelled);
     LanguageWorker {
         sender: request_tx,
         cancelled,
@@ -218,19 +220,32 @@ pub fn start_grammar_language_worker(
     let (request_tx, request_rx) = mpsc::channel();
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = cancelled.clone();
-    std::thread::spawn(move || {
-        prepare_and_run_language(
-            &grammar,
-            grammar.grammar(),
-            request_rx,
-            sender,
-            &worker_cancelled,
-        )
-    });
+    let automaton = Arc::new(grammar.grammar().clone());
+    spawn_language_thread(grammar, automaton, request_rx, sender, worker_cancelled);
     LanguageWorker {
         sender: request_tx,
         cancelled,
     }
+}
+
+fn spawn_language_thread(
+    grammar: Arc<Irtg>,
+    automaton: Arc<Explicit>,
+    requests: Receiver<usize>,
+    events: Sender<LanguageEvent>,
+    cancelled: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let failure_events = events.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prepare_and_run_language(&grammar, &automaton, requests, events, &cancelled);
+        }));
+        if result.is_err() && !cancelled.load(Ordering::Relaxed) {
+            let _ = failure_events.send(LanguageEvent::Failed(
+                "The background language worker stopped unexpectedly.".into(),
+            ));
+        }
+    });
 }
 
 fn prepare_and_run_language(
@@ -285,7 +300,9 @@ fn prepare_and_run_language(
                         Err(error) => interpretation_error_view(
                             name,
                             Some(term),
-                            format!("The derivation tree did not evaluate in this algebra: {error}"),
+                            format!(
+                                "The derivation tree did not evaluate in this algebra: {error}"
+                            ),
                         ),
                         Ok(evaluated) => {
                             let value = match evaluated.visual() {
@@ -320,13 +337,12 @@ fn prepare_and_run_language(
                 views,
             }));
         }
-        if let Some(item) = cache.get(requested) {
-            if events
+        if let Some(item) = cache.get(requested)
+            && events
                 .send(LanguageEvent::Derivation(item.clone()))
                 .is_err()
-            {
-                return;
-            }
+        {
+            return;
         }
     }
 }
@@ -561,8 +577,10 @@ fn layout_feature_structure(value: &FeatureStructure) -> FeatureStructureLayout 
         expanded: &mut HashSet<FeatureStructureNodeId>,
     ) -> FeatureStructureLayout {
         let marker = markers.get(&node).copied();
-        if marker.is_some() && !expanded.insert(node) {
-            return marker_block(marker.unwrap());
+        if let Some(marker) = marker
+            && !expanded.insert(node)
+        {
+            return marker_block(marker);
         }
         if marker.is_none() {
             expanded.insert(node);
@@ -584,10 +602,7 @@ fn layout_feature_structure(value: &FeatureStructure) -> FeatureStructureLayout 
                     .iter()
                     .map(|attribute| node_block(value, attribute.value, markers, expanded))
                     .collect::<Vec<_>>();
-                let child_width = children
-                    .iter()
-                    .map(|child| child.width)
-                    .fold(0.0, f32::max);
+                let child_width = children.iter().map(|child| child.width).fold(0.0, f32::max);
                 let row_heights = children
                     .iter()
                     .map(|child| child.height.max(FS_LINE_HEIGHT) + FS_ROW_GAP)
@@ -710,7 +725,7 @@ mod tests {
     use rusty_alto::parse_irtg;
     use std::time::Duration;
 
-const SCFG: &str = r#"
+    const SCFG: &str = r#"
 interpretation english: de.up.ling.irtg.algebra.StringAlgebra
 interpretation german: de.up.ling.irtg.algebra.StringAlgebra
 
@@ -808,8 +823,7 @@ lemma 'hälfe': <vinf_tv>[objcase=dat] {
 
     #[test]
     fn loads_parses_and_pages_derivations() {
-        let directory =
-            std::env::temp_dir().join(format!("rusty_alto_gui_{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!("rusty_alto_gui_{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let grammar_path = directory.join("tiny.irtg");
         std::fs::write(
@@ -900,29 +914,29 @@ VP -> sleeps
 
         let unknown = directory.join("grammar.unknown");
         std::fs::write(&unknown, "").unwrap();
-        assert!(load_grammar(unknown).unwrap_err().contains("no input codec"));
+        assert!(
+            load_grammar(unknown)
+                .unwrap_err()
+                .contains("no input codec")
+        );
         let extensionless = directory.join("grammar");
         std::fs::write(&extensionless, "").unwrap();
-        assert!(load_grammar(extensionless).unwrap_err().contains("extension"));
+        assert!(
+            load_grammar(extensionless)
+                .unwrap_err()
+                .contains("extension")
+        );
     }
 
     #[test]
     fn feature_structure_layout_marks_shared_nodes() {
-        let value =
-            FeatureStructure::parse("[left: #x [case: nom], right: #x, open: #y]").unwrap();
+        let value = FeatureStructure::parse("[left: #x [case: nom], right: #x, open: #y]").unwrap();
         let layout = layout_feature_structure(&value);
         assert!(layout.width > 100.0);
         assert!(layout.height > 40.0);
         assert!(layout.texts.iter().any(|text| text.text == "left"));
         assert!(layout.texts.iter().any(|text| text.text == "right"));
-        assert!(
-            layout
-                .texts
-                .iter()
-                .filter(|text| text.text == "1")
-                .count()
-                >= 2
-        );
+        assert!(layout.texts.iter().filter(|text| text.text == "1").count() >= 2);
         assert!(!layout.boxes.is_empty());
     }
 
@@ -1099,11 +1113,6 @@ VP -> sleeps
                 .iter()
                 .any(|rule| rule.parent.contains("_S") && rule.parent.contains('['))
         );
-        assert!(
-            chart
-                .rules
-                .iter()
-                .all(|rule| !rule.parent.starts_with('q'))
-        );
+        assert!(chart.rules.iter().all(|rule| !rule.parent.starts_with('q')));
     }
 }

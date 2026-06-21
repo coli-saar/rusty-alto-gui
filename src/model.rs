@@ -52,7 +52,7 @@ impl RuleRow {
 pub struct InputField {
     pub name: String,
     pub value: String,
-    pub id: iced::widget::text_input::Id,
+    pub id: iced::widget::Id,
     pub input_capable: bool,
     pub non_null_filter_capable: bool,
     pub require_valid: bool,

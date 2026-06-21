@@ -1,20 +1,23 @@
 use crate::{
+    app_state::{
+        CopyMenu, LanguageSession, LanguageStatus, ParseJob, ParseSession, Selection, Workbench,
+    },
     feature_canvas::feature_structure_view,
     model::{
-        ChartDocument, DerivationPresentation, DocumentTab, GrammarDocument, HeuristicChoice,
-        InputField, RuleColumn, RuleRow, StrategyChoice, ValuePresentation,
+        ChartDocument, DocumentTab, GrammarDocument, HeuristicChoice, InputField, RuleColumn,
+        RuleRow, StrategyChoice, ValuePresentation,
     },
     theme,
     tree_canvas::tree_view,
-    workers::{self, LanguageEvent, LanguageWorker},
+    workers::{self, LanguageEvent},
 };
 use iced::{
-    Alignment, Element, Event, Length, Point, Subscription, Task, clipboard, event, mouse,
+    Alignment, Element, Event, Length, Point, Subscription, Task, clipboard, event,
     keyboard::{Key, Modifiers, key::Named},
+    mouse,
     widget::{
-        Column, Row, button, checkbox, column, container, horizontal_rule, horizontal_space,
-        mouse_area, pick_list, rich_text, row, scrollable, span, stack, text, text_input,
-        vertical_rule, vertical_space,
+        Column, Row, button, checkbox, column, container, mouse_area, pick_list, rich_text, row,
+        rule, scrollable, space, span, stack, text, text_input, tooltip,
     },
     window,
 };
@@ -25,27 +28,32 @@ use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, mpsc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub fn run() -> iced::Result {
-    iced::daemon(app_title, app_update, app_view)
-        .theme(|_app, _id| iced::Theme::Light)
-        .font(include_bytes!("../assets/fonts/Inter-Regular.ttf").as_slice())
-        .font(include_bytes!("../assets/fonts/Inter-Medium.ttf").as_slice())
-        .font(include_bytes!("../assets/fonts/Inter-SemiBold.ttf").as_slice())
-        .default_font(iced::Font {
-            family: iced::font::Family::Name("Inter"),
-            weight: iced::font::Weight::Medium,
-            ..iced::Font::DEFAULT
-        })
-        .subscription(app_subscription)
-        .run_with(|| {
+    iced::daemon(
+        || {
             let mut app = App::default();
             let (id, open) = window::open(window_settings());
             app.windows.insert(id, Workbench::default());
             (app, open.map(AppMsg::WindowOpened))
-        })
+        },
+        app_update,
+        app_view,
+    )
+    .title(app_title)
+    .theme(iced::Theme::Light)
+    .font(include_bytes!("../assets/fonts/Inter-Regular.ttf").as_slice())
+    .font(include_bytes!("../assets/fonts/Inter-Medium.ttf").as_slice())
+    .font(include_bytes!("../assets/fonts/Inter-SemiBold.ttf").as_slice())
+    .default_font(iced::Font {
+        family: iced::font::Family::Name("Inter"),
+        weight: iced::font::Weight::Medium,
+        ..iced::Font::DEFAULT
+    })
+    .subscription(app_subscription)
+    .run()
 }
 
 fn window_settings() -> window::Settings {
@@ -74,7 +82,12 @@ enum AppMsg {
     WindowOpened(window::Id),
     CloseWindow(window::Id),
     GrammarPicked(window::Id, Option<PathBuf>),
-    GrammarLoaded(window::Id, Result<GrammarDocument, String>),
+    GrammarLoaded {
+        asking: window::Id,
+        target: window::Id,
+        opened_new: bool,
+        result: Result<GrammarDocument, String>,
+    },
     Poll,
     #[cfg(target_os = "macos")]
     WindowFocused(window::Id),
@@ -99,7 +112,7 @@ fn window_title(state: &Workbench) -> String {
 fn app_view(app: &App, id: window::Id) -> Element<'_, AppMsg> {
     match app.windows.get(&id) {
         Some(window) => view(window).map(move |message| AppMsg::Window(id, message)),
-        None => horizontal_space().into(),
+        None => space::horizontal().into(),
     }
 }
 
@@ -116,10 +129,10 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
             Task::perform(
                 async move {
                     rfd::AsyncFileDialog::new()
-                    .add_filter("IRTG grammars", &extensions)
-                    .pick_file()
-                    .await
-                    .map(|handle| handle.path().to_owned())
+                        .add_filter("IRTG grammars", &extensions)
+                        .pick_file()
+                        .await
+                        .map(|handle| handle.path().to_owned())
                 },
                 move |path| AppMsg::GrammarPicked(id, path),
             )
@@ -136,29 +149,54 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
                 .windows
                 .get(&asking_id)
                 .is_none_or(|window| window.grammar.is_some());
-            let (target, open_task) = if needs_new_window {
+            let (target, opened_new, open_task) = if needs_new_window {
                 let (new_id, open) = window::open(window_settings());
                 app.windows.insert(new_id, Workbench::default());
-                (new_id, open.map(AppMsg::WindowOpened))
+                (new_id, true, open.map(AppMsg::WindowOpened))
             } else {
-                (asking_id, Task::none())
+                (asking_id, false, Task::none())
             };
             if let Some(window) = app.windows.get_mut(&target) {
                 window.busy = Some(format!("Loading {}…", display_name(&path)));
                 window.error = None;
             }
-            let load = Task::perform(
-                async move { workers::load_grammar(path) },
-                move |result| AppMsg::GrammarLoaded(target, result),
-            );
+            let load = Task::perform(async move { workers::load_grammar(path) }, move |result| {
+                AppMsg::GrammarLoaded {
+                    asking: asking_id,
+                    target,
+                    opened_new,
+                    result,
+                }
+            });
             Task::batch([open_task, load])
         }
-        AppMsg::GrammarLoaded(id, result) => {
-            if let Some(window) = app.windows.get_mut(&id) {
-                window.apply_grammar(result);
+        AppMsg::GrammarLoaded {
+            asking,
+            target,
+            opened_new,
+            result,
+        } => match result {
+            Ok(document) => {
+                if let Some(window) = app.windows.get_mut(&target) {
+                    window.apply_grammar(Ok(document));
+                }
+                Task::none()
             }
-            Task::none()
-        }
+            Err(error) if opened_new => {
+                app.windows.remove(&target);
+                if let Some(window) = app.windows.get_mut(&asking) {
+                    window.busy = None;
+                    window.fail(format!("Could not load grammar: {error}"));
+                }
+                window::close(target)
+            }
+            Err(error) => {
+                if let Some(window) = app.windows.get_mut(&target) {
+                    window.apply_grammar(Err(error));
+                }
+                Task::none()
+            }
+        },
         AppMsg::WindowOpened(id) => {
             // Install the native menu bar once, now that NSApp is running on the
             // main thread (this update runs on the winit/main thread), and add
@@ -167,9 +205,9 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
             {
                 if !app.menu_installed {
                     app.menu_installed = true;
-                    macos_menu::install();
+                    crate::platform_menu::install();
                 }
-                macos_menu::refresh_windows_menu();
+                crate::platform_menu::refresh_windows_menu();
             }
             window::gain_focus(id)
         }
@@ -197,24 +235,21 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
             let mut tasks = Vec::new();
             while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
                 match event.id.0.as_str() {
-                    macos_menu::OPEN_GRAMMAR_ID => {
+                    crate::platform_menu::OPEN_GRAMMAR_ID => {
                         // Open into the focused window (its handler decides
                         // whether to reuse the window or spawn a new one).
-                        let target = app
-                            .focused
-                            .or_else(|| app.windows.keys().next().copied());
+                        let target = app.focused.or_else(|| app.windows.keys().next().copied());
                         if let Some(id) = target {
                             tasks.push(app_update(app, AppMsg::Window(id, Message::OpenGrammar)));
                         }
                     }
-                    macos_menu::NEW_PARSE_ID => {
-                        if let Some(id) =
-                            app.focused.or_else(|| app.windows.keys().next().copied())
+                    crate::platform_menu::NEW_PARSE_ID => {
+                        if let Some(id) = app.focused.or_else(|| app.windows.keys().next().copied())
                         {
                             tasks.push(app_update(app, AppMsg::Window(id, Message::NewParse)));
                         }
                     }
-                    macos_menu::CLOSE_ALL_ID => {
+                    crate::platform_menu::CLOSE_ALL_ID => {
                         app.windows.clear();
                         tasks.push(iced::exit());
                     }
@@ -227,7 +262,10 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
 }
 
 fn app_subscription(app: &App) -> Subscription<AppMsg> {
-    let needs_poll = app.windows.values().any(Workbench::has_pending_language);
+    let needs_poll = app
+        .windows
+        .values()
+        .any(|window| window.has_pending_language() || window.active_parse.is_some());
     let polling = if needs_poll {
         iced::time::every(Duration::from_millis(80)).map(|_| AppMsg::Poll)
     } else {
@@ -248,6 +286,9 @@ fn app_subscription(app: &App) -> Subscription<AppMsg> {
         Event::Mouse(mouse::Event::CursorMoved { position }) => {
             Some(AppMsg::Window(id, Message::CursorMoved(position)))
         }
+        Event::Window(window::Event::Resized(size)) => {
+            Some(AppMsg::Window(id, Message::WindowResized(size)))
+        }
         #[cfg(target_os = "macos")]
         Event::Window(window::Event::Focused) => Some(AppMsg::WindowFocused(id)),
         _ => None,
@@ -260,134 +301,6 @@ fn app_subscription(app: &App) -> Subscription<AppMsg> {
     #[cfg(target_os = "macos")]
     subscriptions.push(iced::time::every(Duration::from_millis(120)).map(|_| AppMsg::MenuPoll));
     Subscription::batch(subscriptions)
-}
-
-/// Native macOS menu bar via muda. The predefined items (Quit, Hide, Minimize,
-/// and the auto-populated window list) are handled by AppKit itself, so no menu
-/// events need routing back into iced. A top-of-screen menu bar is a macOS
-/// concept; the muda API is cross-platform, so adding Windows/Linux later is an
-/// extra init call rather than a rewrite.
-#[cfg(target_os = "macos")]
-mod macos_menu {
-    use muda::{
-        AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu,
-        accelerator::{Accelerator, Code, Modifiers},
-    };
-
-    pub const OPEN_GRAMMAR_ID: &str = "open-grammar";
-    pub const NEW_PARSE_ID: &str = "new-parse";
-    pub const CLOSE_ALL_ID: &str = "close-all";
-    const APP_NAME: &str = "Rusty Alto";
-
-    /// ⌘ on macOS (this menu is macOS-only).
-    fn cmd(code: Code) -> Accelerator {
-        Accelerator::new(Some(Modifiers::SUPER), code)
-    }
-
-    pub fn install() {
-        let menu = Menu::new();
-
-        // The application menu (its bold name comes from the process name).
-        let app_menu = Submenu::new(APP_NAME, true);
-        let about = PredefinedMenuItem::about(
-            Some(&format!("About {APP_NAME}")),
-            Some(AboutMetadata {
-                name: Some(APP_NAME.to_owned()),
-                ..Default::default()
-            }),
-        );
-        let hide = PredefinedMenuItem::hide(Some(&format!("Hide {APP_NAME}")));
-        let quit = PredefinedMenuItem::quit(Some(&format!("Quit {APP_NAME}")));
-        let _ = app_menu.append_items(&[
-            &about,
-            &PredefinedMenuItem::separator(),
-            &PredefinedMenuItem::services(None),
-            &PredefinedMenuItem::separator(),
-            &hide,
-            &PredefinedMenuItem::hide_others(None),
-            &PredefinedMenuItem::show_all(None),
-            &PredefinedMenuItem::separator(),
-            &quit,
-        ]);
-
-        // File: custom items routed back through muda's event channel; Close
-        // Window is the native ⌘W item.
-        let file_menu = Submenu::new("File", true);
-        let open_grammar =
-            MenuItem::with_id(OPEN_GRAMMAR_ID, "Open grammar…", true, Some(cmd(Code::KeyO)));
-        let new_parse = MenuItem::with_id(NEW_PARSE_ID, "Parse…", true, Some(cmd(Code::KeyP)));
-        let close_all = MenuItem::with_id(
-            CLOSE_ALL_ID,
-            "Close All Windows",
-            true,
-            Some(Accelerator::new(
-                Some(Modifiers::SUPER | Modifiers::SHIFT),
-                Code::KeyW,
-            )),
-        );
-        let _ = file_menu.append_items(&[
-            &open_grammar,
-            &new_parse,
-            &PredefinedMenuItem::separator(),
-            &PredefinedMenuItem::close_window(None),
-            &close_all,
-        ]);
-
-        // Window: AppKit auto-populates this with the open windows.
-        let window_menu = Submenu::new("Window", true);
-        let _ = window_menu.append_items(&[
-            &PredefinedMenuItem::minimize(None),
-            &PredefinedMenuItem::maximize(None),
-            &PredefinedMenuItem::separator(),
-            &PredefinedMenuItem::bring_all_to_front(None),
-        ]);
-
-        // Window is the last submenu; refresh_windows_menu designates the menu
-        // actually shown in the bar as the Windows menu (muda's
-        // set_as_windows_menu_for_nsapp targets a standalone copy instead).
-        // Do not install AppKit's predefined Edit commands here. They consume
-        // Cmd-C/X/V/A before Iced's canvas-based text inputs receive the key
-        // events, but cannot operate on those non-native text controls.
-        let _ = menu.append_items(&[&app_menu, &file_menu, &window_menu]);
-        menu.init_for_nsapp();
-
-        // AppKit retains the NSMenu, but keep muda's wrappers alive for the
-        // process lifetime so the menu isn't torn down.
-        std::mem::forget(menu);
-    }
-
-    /// Point NSApp.windowsMenu at the visible "Window" submenu and register the
-    /// current windows. AppKit doesn't auto-track winit's windows, so we add
-    /// them; it then keeps their titles in sync and removes them on close.
-    /// `addWindowsItem` ignores duplicates, so re-running is safe.
-    pub fn refresh_windows_menu() {
-        use objc2_app_kit::NSApplication;
-        use objc2_foundation::MainThreadMarker;
-
-        let Some(mtm) = MainThreadMarker::new() else {
-            return;
-        };
-        let app = NSApplication::sharedApplication(mtm);
-
-        // The Window submenu shown in the menu bar is the last item we appended.
-        if let Some(main_menu) = unsafe { app.mainMenu() } {
-            let count = unsafe { main_menu.numberOfItems() };
-            if count > 0 {
-                if let Some(submenu) = unsafe { main_menu.itemAtIndex(count - 1) }
-                    .and_then(|item| unsafe { item.submenu() })
-                {
-                    unsafe { app.setWindowsMenu(Some(&submenu)) };
-                }
-            }
-        }
-
-        let windows = app.windows();
-        for i in 0..windows.count() {
-            let window = unsafe { windows.objectAtIndex(i) };
-            let title = window.title();
-            unsafe { app.addWindowsItem_title_filename(&window, &title, false) };
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -408,7 +321,8 @@ pub enum Message {
     FocusNext,
     FocusPrevious,
     Parse,
-    Parsed(Result<ChartDocument, String>),
+    CancelParse,
+    Parsed(u64, Result<ChartDocument, String>),
     PreviousDerivation,
     NextDerivation,
     SelectOutput(usize),
@@ -419,146 +333,24 @@ pub enum Message {
     ShortcutPrevious,
     ShortcutNext,
     CursorMoved(Point),
+    WindowResized(iced::Size),
     OpenCopyMenu(Arc<EvaluatedAlgebraValue>, Vec<CodecMetadata>),
     CloseCopyMenu,
     CopyWithCodec(String),
-}
-
-pub struct Workbench {
-    grammar: Option<GrammarDocument>,
-    grammar_language: Option<LanguageSession>,
-    parses: Vec<ParseSession>,
-    next_parse_id: u64,
-    selection: Selection,
-    active_tab: DocumentTab,
-    inputs: Vec<InputField>,
-    strategy: StrategyChoice,
-    heuristic: HeuristicChoice,
-    stop_at_first_goal: bool,
-    pending_label: Option<String>,
-    busy: Option<String>,
-    error: Option<String>,
-    cursor_position: Point,
-    copy_menu: Option<CopyMenu>,
-}
-
-struct CopyMenu {
-    position: Point,
-    value: Arc<EvaluatedAlgebraValue>,
-    codecs: Vec<CodecMetadata>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Selection {
-    Grammar,
-    Parse(u64),
-    NewParse,
-}
-
-struct ParseSession {
-    id: u64,
-    label: String,
-    chart: ChartDocument,
-    language: LanguageSession,
-}
-
-struct LanguageSession {
-    status: LanguageStatus,
-    receiver: Option<mpsc::Receiver<LanguageEvent>>,
-    worker: Option<LanguageWorker>,
-    derivations: Vec<Arc<DerivationPresentation>>,
-    derivation_index: usize,
-    output_index: usize,
-    zoom: f32,
-}
-
-#[derive(Debug, Clone)]
-enum LanguageStatus {
-    Preparing,
-    Ready(LanguageCardinality),
-}
-
-impl Default for Workbench {
-    fn default() -> Self {
-        Self {
-            grammar: None,
-            grammar_language: None,
-            parses: Vec::new(),
-            next_parse_id: 1,
-            selection: Selection::Grammar,
-            active_tab: DocumentTab::Primary,
-            inputs: Vec::new(),
-            strategy: StrategyChoice::TopDown,
-            heuristic: HeuristicChoice::Zero,
-            stop_at_first_goal: false,
-            pending_label: None,
-            busy: None,
-            error: None,
-            cursor_position: Point::ORIGIN,
-            copy_menu: None,
-        }
-    }
-}
-
-impl LanguageSession {
-    fn preparing(worker: LanguageWorker, receiver: mpsc::Receiver<LanguageEvent>) -> Self {
-        Self {
-            status: LanguageStatus::Preparing,
-            receiver: Some(receiver),
-            worker: Some(worker),
-            derivations: Vec::new(),
-            derivation_index: 0,
-            output_index: 0,
-            zoom: 1.0,
-        }
-    }
-
-    fn ready(&self) -> bool {
-        matches!(self.status, LanguageStatus::Ready(_))
-    }
-
-    fn has_next(&self) -> bool {
-        match self.status {
-            LanguageStatus::Ready(LanguageCardinality::Finite(size)) => {
-                self.derivation_index + 1 < size
-            }
-            LanguageStatus::Ready(
-                LanguageCardinality::Infinite | LanguageCardinality::TooLarge,
-            ) => true,
-            _ => false,
-        }
-    }
-
-    fn size_label(&self) -> String {
-        match self.status {
-            LanguageStatus::Ready(LanguageCardinality::Finite(size)) => size.to_string(),
-            LanguageStatus::Ready(LanguageCardinality::Infinite) => "∞".into(),
-            LanguageStatus::Ready(LanguageCardinality::TooLarge) => "many".into(),
-            _ => "…".into(),
-        }
-    }
-
-    fn sidebar_status(&self) -> String {
-        match &self.status {
-            LanguageStatus::Preparing => "Preparing language…".into(),
-            LanguageStatus::Ready(LanguageCardinality::Finite(0)) => "Empty language".into(),
-            LanguageStatus::Ready(LanguageCardinality::Finite(1)) => "1 derivation".into(),
-            LanguageStatus::Ready(LanguageCardinality::Finite(size)) => {
-                format!("{size} derivations")
-            }
-            LanguageStatus::Ready(LanguageCardinality::Infinite) => "∞ derivations".into(),
-            LanguageStatus::Ready(LanguageCardinality::TooLarge) => "Many derivations".into(),
-        }
-    }
+    ShowShortcuts,
+    HideShortcuts,
 }
 
 fn update(state: &mut Workbench, message: Message) -> Task<Message> {
     if !matches!(
         message,
         Message::CursorMoved(_)
+            | Message::WindowResized(_)
             | Message::OpenCopyMenu(_, _)
             | Message::CloseCopyMenu
             | Message::CopyWithCodec(_)
+            | Message::ShowShortcuts
+            | Message::HideShortcuts
     ) {
         state.copy_menu = None;
     }
@@ -639,9 +431,12 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
         Message::StopAtFirstGoal(value) => {
             state.stop_at_first_goal = value && state.constraint_count() <= 1;
         }
-        Message::FocusNext => return iced::widget::focus_next(),
-        Message::FocusPrevious => return iced::widget::focus_previous(),
+        Message::FocusNext => return iced::widget::operation::focus_next(),
+        Message::FocusPrevious => return iced::widget::operation::focus_previous(),
         Message::Parse => {
+            if state.active_parse.is_some() {
+                return Task::none();
+            }
             let Some(grammar) = state
                 .grammar
                 .as_ref()
@@ -668,8 +463,13 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
                 return Task::none();
             }
             state.pending_label = Some(parse_label(&inputs, &required_valid));
-            state.busy = Some("Computing parse chart…".into());
             state.error = None;
+            let job_id = state.next_parse_job_id;
+            state.next_parse_job_id += 1;
+            state.active_parse = Some(ParseJob {
+                id: job_id,
+                started: Instant::now(),
+            });
             let strategy = state.strategy;
             let heuristic = state.heuristic;
             let stop_at_first_goal = state.stop_at_first_goal && state.constraint_count() <= 1;
@@ -684,11 +484,18 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
                         stop_at_first_goal,
                     )
                 },
-                Message::Parsed,
+                move |result| Message::Parsed(job_id, result),
             );
         }
-        Message::Parsed(result) => {
-            state.busy = None;
+        Message::CancelParse => {
+            state.active_parse = None;
+            state.pending_label = None;
+        }
+        Message::Parsed(job_id, result) => {
+            if state.active_parse.is_none_or(|job| job.id != job_id) {
+                return Task::none();
+            }
+            state.active_parse = None;
             match result {
                 Ok(chart) => {
                     let Some(grammar) = &state.grammar else {
@@ -730,10 +537,12 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
             if let Some(language) = state.active_language_mut() {
                 if language.derivation_index + 1 < language.derivations.len() {
                     language.derivation_index += 1;
-                } else if language.has_next() {
-                    if let Some(worker) = &language.worker {
-                        worker.request(language.derivation_index + 1);
-                    }
+                } else if language.has_next()
+                    && !language.request_pending
+                    && let Some(worker) = &language.worker
+                {
+                    language.request_pending = true;
+                    worker.request(language.derivation_index + 1);
                 }
             }
         }
@@ -768,14 +577,20 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
             }
         }
         Message::CursorMoved(position) => state.cursor_position = position,
+        Message::WindowResized(size) => state.viewport_size = size,
         Message::OpenCopyMenu(value, codecs) => {
+            let position =
+                clamp_menu_position(state.cursor_position, state.viewport_size, codecs.len());
             state.copy_menu = Some(CopyMenu {
-                position: state.cursor_position,
+                position,
                 value,
                 codecs,
             });
         }
-        Message::CloseCopyMenu => state.copy_menu = None,
+        Message::CloseCopyMenu => {
+            state.copy_menu = None;
+            state.show_shortcuts = false;
+        }
         Message::CopyWithCodec(codec_name) => {
             let encoded = state
                 .copy_menu
@@ -788,28 +603,63 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
                 None => {}
             }
         }
+        Message::ShowShortcuts => {
+            state.copy_menu = None;
+            state.show_shortcuts = true;
+        }
+        Message::HideShortcuts => state.show_shortcuts = false,
     }
     Task::none()
 }
 
+const COPY_MENU_WIDTH: f32 = 250.0;
+
+fn clamp_menu_position(cursor: Point, viewport: iced::Size, item_count: usize) -> Point {
+    let margin = 8.0;
+    let menu_height = 34.0 + item_count as f32 * 36.0;
+    Point::new(
+        (cursor.x + 4.0)
+            .min((viewport.width - COPY_MENU_WIDTH - margin).max(margin))
+            .max(margin),
+        (cursor.y + 4.0)
+            .min((viewport.height - menu_height - margin).max(margin))
+            .max(margin),
+    )
+}
+
 fn poll_language(language: &mut LanguageSession) -> bool {
-    let events = language
-        .receiver
-        .as_ref()
-        .map(|receiver| receiver.try_iter().take(32).collect::<Vec<_>>())
-        .unwrap_or_default();
+    if !language.polling() {
+        return false;
+    }
+    let mut disconnected = false;
+    let mut events = Vec::new();
+    if let Some(receiver) = &language.receiver {
+        for _ in 0..32 {
+            match receiver.try_recv() {
+                Ok(event) => events.push(event),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+    }
     let changed = !events.is_empty();
     for event in events {
         match event {
             LanguageEvent::Ready(size) => {
                 language.status = LanguageStatus::Ready(size);
-                if size != LanguageCardinality::Finite(0)
-                    && let Some(worker) = &language.worker
-                {
+                if size == LanguageCardinality::Finite(0) {
+                    language.receiver = None;
+                    language.worker = None;
+                } else if let Some(worker) = &language.worker {
+                    language.request_pending = true;
                     worker.request(0);
                 }
             }
             LanguageEvent::Derivation(item) => {
+                language.request_pending = false;
                 let index = item.index;
                 if index == language.derivations.len() {
                     language.derivations.push(item);
@@ -819,32 +669,116 @@ fn poll_language(language: &mut LanguageSession) -> bool {
                 if index == language.derivation_index + 1 {
                     language.derivation_index = index;
                 }
+                if matches!(
+                    language.status,
+                    LanguageStatus::Ready(LanguageCardinality::Finite(size))
+                        if language.derivations.len() >= size
+                ) {
+                    language.receiver = None;
+                    language.worker = None;
+                }
             }
             LanguageEvent::EndOfLanguage(count) => {
                 language.status = LanguageStatus::Ready(LanguageCardinality::Finite(count));
+                language.request_pending = false;
+                language.receiver = None;
+                language.worker = None;
+            }
+            LanguageEvent::Failed(error) => {
+                language.status = LanguageStatus::Failed(error);
+                language.request_pending = false;
+                language.receiver = None;
+                language.worker = None;
             }
         }
+    }
+    if disconnected && language.receiver.is_some() {
+        language.status = LanguageStatus::Failed(
+            "The background language worker disconnected unexpectedly.".into(),
+        );
+        language.request_pending = false;
+        language.receiver = None;
+        language.worker = None;
+        return true;
     }
     changed
 }
 
 fn view(state: &Workbench) -> Element<'_, Message> {
-    let body = row![sidebar(state), vertical_rule(1), workspace(state)].height(Length::Fill);
+    let body = row![sidebar(state), rule::vertical(1), workspace(state)].height(Length::Fill);
 
     let content = container(column![body, status_bar(state)])
         .width(Length::Fill)
         .height(Length::Fill)
         .style(theme::workspace);
-    if let Some(menu) = &state.copy_menu {
+    if state.show_shortcuts {
+        stack![content, shortcuts_overlay()].into()
+    } else if let Some(menu) = &state.copy_menu {
         stack![content, copy_menu_overlay(menu)].into()
     } else {
         content.into()
     }
 }
 
+fn shortcuts_overlay() -> Element<'static, Message> {
+    let dismiss = mouse_area(
+        container(space::horizontal())
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .on_press(Message::HideShortcuts);
+    let shortcuts = [
+        ("Open grammar", "⌘/Ctrl O"),
+        ("New parse", "⌘/Ctrl P"),
+        ("Next field", "Tab"),
+        ("Previous field", "Shift Tab"),
+        ("Previous derivation", "←"),
+        ("Next derivation", "→"),
+        ("Show this dialog", "?"),
+        ("Dismiss dialog or menu", "Esc"),
+    ];
+    let mut rows = Column::new().spacing(8);
+    for (action, keys) in shortcuts {
+        rows = rows.push(
+            row![
+                text(action).size(13).width(Length::Fill),
+                text(keys).size(12).color(theme::MUTED),
+            ]
+            .align_y(Alignment::Center),
+        );
+    }
+    let panel = container(
+        column![
+            row![
+                text("Keyboard shortcuts").size(19),
+                space::horizontal(),
+                button(text("Close").size(12))
+                    .style(theme::quiet_button)
+                    .on_press(Message::HideShortcuts),
+            ]
+            .align_y(Alignment::Center),
+            text("Shortcuts apply to the focused Rusty Alto window.")
+                .size(12)
+                .color(theme::MUTED),
+            rule::horizontal(1).style(theme::separator),
+            rows,
+        ]
+        .spacing(12),
+    )
+    .width(Length::Fixed(430.0))
+    .padding(18)
+    .style(theme::raised);
+    let centered = container(panel)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill);
+    stack![dismiss, centered].into()
+}
+
 fn copy_menu_overlay(menu: &CopyMenu) -> Element<'_, Message> {
     let dismiss = mouse_area(
-        container(horizontal_space())
+        container(space::horizontal())
             .width(Length::Fill)
             .height(Length::Fill),
     )
@@ -864,13 +798,13 @@ fn copy_menu_overlay(menu: &CopyMenu) -> Element<'_, Message> {
         );
     }
     let menu_panel = container(items)
-        .width(Length::Fixed(250.0))
+        .width(Length::Fixed(COPY_MENU_WIDTH))
         .padding(8)
         .style(theme::raised);
     let positioned = column![
-        vertical_space().height(Length::Fixed(menu.position.y + 4.0)),
+        space::vertical().height(Length::Fixed(menu.position.y)),
         row![
-            horizontal_space().width(Length::Fixed(menu.position.x + 4.0)),
+            space::horizontal().width(Length::Fixed(menu.position.x)),
             menu_panel
         ]
     ]
@@ -940,12 +874,15 @@ fn sidebar(state: &Workbench) -> Element<'_, Message> {
             state.selection == Selection::Parse(id),
             Message::SelectParse(id),
         );
-        let remove = container(
-            button(text("×").size(14))
-                .padding([1, 7])
-                .style(theme::quiet_button)
-                .on_press(Message::RemoveParse(id)),
-        )
+        let remove_button = button(text("×").size(14))
+            .padding([1, 7])
+            .style(theme::quiet_button)
+            .on_press(Message::RemoveParse(id));
+        let remove = container(tooltip(
+            remove_button,
+            text("Remove this parse").size(12),
+            tooltip::Position::Left,
+        ))
         .align_right(Length::Fill)
         .center_y(Length::Fill)
         .padding([0, 6]);
@@ -956,15 +893,23 @@ fn sidebar(state: &Workbench) -> Element<'_, Message> {
         .width(Length::Fill)
         .padding([10, 18])
         .style(theme::parse_button);
-    let parse_button = if state.grammar.is_some() && state.busy.is_none() {
-        parse_button.on_press(Message::NewParse)
-    } else {
-        parse_button
-    };
+    let parse_button =
+        if state.grammar.is_some() && state.busy.is_none() && state.active_parse.is_none() {
+            parse_button.on_press(Message::NewParse)
+        } else {
+            parse_button
+        };
+
+    let shortcuts = button(text("Keyboard shortcuts  ?").size(12))
+        .width(Length::Fill)
+        .padding([7, 10])
+        .style(theme::quiet_button)
+        .on_press(Message::ShowShortcuts);
 
     container(
         column![
             scrollable(documents.padding([12, 0])).height(Length::Fill),
+            shortcuts,
             parse_button,
         ]
         .padding([12, 10])
@@ -1029,7 +974,10 @@ fn view_selector<'a>(
     let primary = button(segment_label(primary_label))
         .width(Length::Fixed(SEGMENT_WIDTH))
         .padding([7, 10])
-        .style(theme::segment(active_tab == DocumentTab::Primary, [R, 0.0, 0.0, R]))
+        .style(theme::segment(
+            active_tab == DocumentTab::Primary,
+            [R, 0.0, 0.0, R],
+        ))
         .on_press(Message::SelectTab(DocumentTab::Primary));
 
     let language_active = language_ready && active_tab == DocumentTab::Language;
@@ -1151,7 +1099,7 @@ fn parse_page(state: &Workbench) -> Element<'_, Message> {
                 .on_paste(move |value| Message::InputChanged(index, value))
                 .padding(9)
                 .size(13);
-            if state.busy.is_none() {
+            if state.busy.is_none() && state.active_parse.is_none() {
                 field = field.on_submit(Message::Parse);
             }
             row = row.push(field);
@@ -1164,8 +1112,9 @@ fn parse_page(state: &Workbench) -> Element<'_, Message> {
         }
         if input.non_null_filter_capable {
             let checked = has_exact_input || input.require_valid;
-            let can_toggle = state.busy.is_none() && !has_exact_input;
-            let mut validity = checkbox("Require valid value", checked).size(15);
+            let can_toggle =
+                state.busy.is_none() && state.active_parse.is_none() && !has_exact_input;
+            let mut validity = checkbox(checked).label("Require valid value").size(15);
             if can_toggle {
                 validity =
                     validity.on_toggle(move |value| Message::RequireValidChanged(index, value));
@@ -1186,7 +1135,9 @@ fn parse_page(state: &Workbench) -> Element<'_, Message> {
     .spacing(6);
     if state.strategy == StrategyChoice::Astar {
         let early_stop_supported = state.constraint_count() <= 1;
-        let mut stop = checkbox("Stop after first goal", state.stop_at_first_goal).size(15);
+        let mut stop = checkbox(state.stop_at_first_goal)
+            .label("Stop after first goal")
+            .size(15);
         if early_stop_supported {
             stop = stop.on_toggle(Message::StopAtFirstGoal);
         }
@@ -1209,14 +1160,16 @@ fn parse_page(state: &Workbench) -> Element<'_, Message> {
             );
         }
     }
-    let parse_button = button(text(if state.busy.is_some() {
-        "Parsing…"
+    let parse_button = button(text(if let Some(job) = state.active_parse {
+        format!("Cancel ({:.1}s)", job.started.elapsed().as_secs_f32())
     } else {
-        "Run parser"
+        "Run parser".into()
     }))
     .padding([9, 16])
     .style(button::primary);
-    let parse_button = if state.busy.is_none() {
+    let parse_button = if state.active_parse.is_some() {
+        parse_button.on_press(Message::CancelParse)
+    } else if state.busy.is_none() {
         parse_button.on_press(Message::Parse)
     } else {
         parse_button
@@ -1235,7 +1188,7 @@ fn parse_page(state: &Workbench) -> Element<'_, Message> {
                 .padding(14)
                 .width(Length::Fill)
                 .style(theme::raised),
-            row![horizontal_space(), parse_button],
+            row![space::horizontal(), parse_button],
         ]
         .spacing(theme::SECTION_SPACING)
         .max_width(760),
@@ -1271,6 +1224,12 @@ fn language_page<'a>(
                 "Initializing the sorted language iterator in the background.",
             ),
         ),
+        (LanguageStatus::Failed(error), _) => (
+            "Unavailable".into(),
+            None,
+            None,
+            message_panel("Language preparation failed", error),
+        ),
         (LanguageStatus::Ready(LanguageCardinality::Finite(0)), _) => (
             "Empty language".into(),
             None,
@@ -1299,13 +1258,13 @@ fn language_page<'a>(
                 ValuePresentation::Tree(_) | ValuePresentation::FeatureStructure(_)
             );
             let value: Element<'a, Message> = match &output.value {
-                ValuePresentation::Empty => horizontal_space().into(),
+                ValuePresentation::Empty => space::horizontal().into(),
                 ValuePresentation::Error(error) => {
                     message_panel("Interpretation did not evaluate", error)
                 }
-                ValuePresentation::Text(value) => container(text(value).size(15))
-                    .width(Length::Fill)
-                    .into(),
+                ValuePresentation::Text(value) => {
+                    container(text(value).size(15)).width(Length::Fill).into()
+                }
                 ValuePresentation::Tree(layout) => tree_view(layout.clone(), language.zoom),
                 ValuePresentation::FeatureStructure(layout) => {
                     feature_structure_view(layout.clone(), language.zoom)
@@ -1326,18 +1285,14 @@ fn language_page<'a>(
                 // definite region: a Fill-height message inside a Shrink
                 // section otherwise collapses to an empty VALUE panel.
                 let (value_height, term_height) = match &output.value {
-                    ValuePresentation::Error(_) => {
-                        (Length::Fixed(132.0), Length::Fill)
-                    }
-                    _ if value_is_structured => {
-                        (Length::FillPortion(3), Length::FillPortion(2))
-                    }
+                    ValuePresentation::Error(_) => (Length::Fixed(132.0), Length::Fill),
+                    _ if value_is_structured => (Length::FillPortion(3), Length::FillPortion(2)),
                     _ => (Length::Shrink, Length::Fill),
                 };
                 container(
                     column![
                         panel_section("Value", value, value_height),
-                        horizontal_rule(1).style(theme::separator),
+                        rule::horizontal(1).style(theme::separator),
                         panel_section("Term", tree_view(term.clone(), language.zoom), term_height),
                     ]
                     .height(Length::Fill),
@@ -1366,7 +1321,20 @@ fn language_page<'a>(
             } else {
                 next
             };
-            let nav = row![previous, next].align_y(Alignment::Center).spacing(2);
+            let nav = row![
+                tooltip(
+                    previous,
+                    text("Previous derivation").size(12),
+                    tooltip::Position::Bottom,
+                ),
+                tooltip(
+                    next,
+                    text("Next derivation").size(12),
+                    tooltip::Position::Bottom,
+                ),
+            ]
+            .align_y(Alignment::Center)
+            .spacing(2);
 
             // Interpretation-view tabs sit in the bar, right above the tree.
             let mut tabs = Row::new().spacing(4).align_y(Alignment::Center);
@@ -1383,19 +1351,31 @@ fn language_page<'a>(
                 );
             }
             let zoom = row![
-                button(text("−").size(15))
-                    .style(theme::quiet_button)
-                    .on_press(Message::ZoomOut),
-                button(text(format!("{}%", (language.zoom * 100.0).round() as i32)).size(12))
-                    .style(theme::quiet_button)
-                    .on_press(Message::ZoomReset),
-                button(text("+").size(15))
-                    .style(theme::quiet_button)
-                    .on_press(Message::ZoomIn),
+                tooltip(
+                    button(text("−").size(15))
+                        .style(theme::quiet_button)
+                        .on_press(Message::ZoomOut),
+                    text("Zoom out").size(12),
+                    tooltip::Position::Bottom,
+                ),
+                tooltip(
+                    button(text(format!("{}%", (language.zoom * 100.0).round() as i32)).size(12))
+                        .style(theme::quiet_button)
+                        .on_press(Message::ZoomReset),
+                    text("Reset zoom").size(12),
+                    tooltip::Position::Bottom,
+                ),
+                tooltip(
+                    button(text("+").size(15))
+                        .style(theme::quiet_button)
+                        .on_press(Message::ZoomIn),
+                    text("Zoom in").size(12),
+                    tooltip::Position::Bottom,
+                ),
             ]
             .spacing(2)
             .align_y(Alignment::Center);
-            let extra = row![tabs, horizontal_space(), zoom]
+            let extra = row![tabs, space::horizontal(), zoom]
                 .width(Length::Fill)
                 .align_y(Alignment::Center);
 
@@ -1413,7 +1393,7 @@ fn language_page<'a>(
         }
     };
 
-    let mut heading = row![page_heading(title, subtitle), horizontal_space()]
+    let mut heading = row![page_heading(title, subtitle), space::horizontal()]
         .align_y(Alignment::Center)
         .spacing(5);
     if let Some(nav) = nav {
@@ -1470,6 +1450,16 @@ fn message_panel<'a>(title: &'a str, detail: &'a str) -> Element<'a, Message> {
 fn status_bar(state: &Workbench) -> Element<'_, Message> {
     let (marker, status, color) = if let Some(busy) = &state.busy {
         ("●", busy.as_str(), theme::ACCENT)
+    } else if let Some(job) = state.active_parse {
+        (
+            "●",
+            if job.started.elapsed() < Duration::from_secs(1) {
+                "Computing parse chart…"
+            } else {
+                "Computing parse chart… Cancel is available in the parse form."
+            },
+            theme::ACCENT,
+        )
     } else if let Some(error) = &state.error {
         ("●", error.as_str(), theme::DANGER)
     } else {
@@ -1494,6 +1484,7 @@ fn rule_table<'a>(
     sort: impl Fn(RuleColumn) -> Message + Copy + 'a,
 ) -> Element<'a, Message> {
     let rule_portion = if interpretations.is_empty() { 9 } else { 6 };
+    let table_width = 720.0 + interpretations.len() as f32 * 240.0;
     const WEIGHT_PORTION: u16 = 1;
     const INTERP_PORTION: u16 = 3;
 
@@ -1510,6 +1501,13 @@ fn rule_table<'a>(
                 .width(Length::FillPortion(INTERP_PORTION)),
         );
     }
+    let header = container(header)
+        .center_y(34)
+        .width(Length::Fixed(table_width))
+        .style(|_| iced::widget::container::Style {
+            background: Some(theme::SURFACE.into()),
+            ..Default::default()
+        });
 
     let mut body = Column::new().spacing(0);
     for (index, item) in rows.iter().enumerate() {
@@ -1522,31 +1520,41 @@ fn rule_table<'a>(
         .padding([0, 10])
         .align_y(Alignment::Center);
         for column in 0..interpretations.len() {
-            let term = item.interpretations.get(column).map(String::as_str).unwrap_or("");
+            let term = item
+                .interpretations
+                .get(column)
+                .map(String::as_str)
+                .unwrap_or("");
             cells = cells.push(table_cell(term, INTERP_PORTION));
         }
         body = body.push(
             container(cells)
                 .center_y(theme::TABLE_ROW_HEIGHT)
-                .width(Length::Fill)
+                .width(Length::Fixed(table_width))
                 .style(move |_| iced::widget::container::Style {
-                    background: Some(if index % 2 == 0 { theme::BG } else { theme::SURFACE }.into()),
+                    background: Some(
+                        if index % 2 == 0 {
+                            theme::BG
+                        } else {
+                            theme::SURFACE
+                        }
+                        .into(),
+                    ),
                     text_color: Some(theme::TEXT),
                     ..Default::default()
                 }),
         );
     }
-    container(column![
-        container(header)
-            .center_y(34)
-            .width(Length::Fill)
-            .style(|_| iced::widget::container::Style {
-                background: Some(theme::SURFACE.into()),
-                ..Default::default()
-            }),
-        horizontal_rule(1).style(theme::separator),
-        scrollable(body).height(Length::Fill),
-    ])
+    let table = column![header, rule::horizontal(1).style(theme::separator), body,]
+        .width(Length::Fixed(table_width));
+    container(
+        scrollable(table)
+            .direction(scrollable::Direction::Both {
+                vertical: scrollable::Scrollbar::default(),
+                horizontal: scrollable::Scrollbar::default(),
+            })
+            .height(Length::Fill),
+    )
     .width(Length::Fill)
     .height(Length::Fill)
     // Inset content past the 1px border and clip to the rounded corners so the
@@ -1564,7 +1572,7 @@ fn rule_cell<'a>(parent: &str, rhs: &str, mute_spans: bool) -> Element<'a, Messa
     if !mute_spans {
         return text(full).size(14).into();
     }
-    let mut spans = Vec::new();
+    let mut spans: Vec<iced::widget::text::Span<'_, ()>> = Vec::new();
     let mut buf = String::new();
     let mut buf_muted = false;
     let mut depth: u32 = 0;
@@ -1736,11 +1744,8 @@ impl Workbench {
     fn has_pending_language(&self) -> bool {
         self.grammar_language
             .as_ref()
-            .is_some_and(|language| language.receiver.is_some())
-            || self
-                .parses
-                .iter()
-                .any(|parse| parse.language.receiver.is_some())
+            .is_some_and(LanguageSession::polling)
+            || self.parses.iter().any(|parse| parse.language.polling())
     }
 
     fn parse(&self, id: u64) -> Option<&ParseSession> {
@@ -1779,7 +1784,7 @@ fn input_fields(grammar: &GrammarDocument) -> Vec<InputField> {
         .map(|info| InputField {
             name: info.name.clone(),
             value: String::new(),
-            id: iced::widget::text_input::Id::unique(),
+            id: iced::widget::Id::unique(),
             input_capable: info.input_capable,
             non_null_filter_capable: info.non_null_filter_capable,
             require_valid: false,
@@ -1825,6 +1830,7 @@ fn keyboard_shortcut(key: Key, modifiers: Modifiers) -> Option<Message> {
         Key::Named(Named::Tab) => Some(Message::FocusNext),
         Key::Named(Named::ArrowLeft) if modifiers.is_empty() => Some(Message::ShortcutPrevious),
         Key::Named(Named::ArrowRight) if modifiers.is_empty() => Some(Message::ShortcutNext),
+        Key::Character("?") => Some(Message::ShowShortcuts),
         _ => None,
     }
 }
@@ -1867,6 +1873,132 @@ mod tests {
             keyboard_shortcut(Key::Character("a".into()), Modifiers::COMMAND).is_none(),
             "Cmd/Ctrl-A must reach the focused text input for select-all"
         );
+        assert!(matches!(
+            keyboard_shortcut(Key::Character("?".into()), Modifiers::SHIFT),
+            Some(Message::ShowShortcuts)
+        ));
+    }
+
+    #[test]
+    fn copy_menu_position_is_clamped_to_each_window_edge() {
+        let viewport = iced::Size::new(800.0, 600.0);
+        assert_eq!(
+            clamp_menu_position(Point::new(-20.0, -30.0), viewport, 2),
+            Point::new(8.0, 8.0)
+        );
+        let bottom_right = clamp_menu_position(Point::new(799.0, 599.0), viewport, 2);
+        assert!(bottom_right.x + COPY_MENU_WIDTH <= viewport.width - 8.0);
+        assert!(bottom_right.y + 106.0 <= viewport.height - 8.0);
+    }
+
+    #[test]
+    fn language_failure_is_terminal_and_stops_polling() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(LanguageEvent::Failed("test failure".into()))
+            .unwrap();
+        let mut language = LanguageSession {
+            status: LanguageStatus::Preparing,
+            receiver: Some(receiver),
+            worker: None,
+            derivations: Vec::new(),
+            derivation_index: 0,
+            output_index: 0,
+            zoom: 1.0,
+            request_pending: false,
+        };
+        assert!(poll_language(&mut language));
+        assert!(matches!(language.status, LanguageStatus::Failed(_)));
+        assert!(!language.polling());
+        assert!(language.receiver.is_none());
+    }
+
+    #[test]
+    fn disconnected_language_worker_becomes_a_terminal_failure() {
+        let (sender, receiver) = mpsc::channel::<LanguageEvent>();
+        drop(sender);
+        let mut language = LanguageSession {
+            status: LanguageStatus::Preparing,
+            receiver: Some(receiver),
+            worker: None,
+            derivations: Vec::new(),
+            derivation_index: 0,
+            output_index: 0,
+            zoom: 1.0,
+            request_pending: false,
+        };
+        assert!(poll_language(&mut language));
+        assert!(matches!(language.status, LanguageStatus::Failed(_)));
+        assert!(!language.polling());
+    }
+
+    #[test]
+    fn finite_language_completion_releases_worker_resources() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(LanguageEvent::EndOfLanguage(3)).unwrap();
+        let mut language = LanguageSession {
+            status: LanguageStatus::Ready(LanguageCardinality::TooLarge),
+            receiver: Some(receiver),
+            worker: None,
+            derivations: Vec::new(),
+            derivation_index: 2,
+            output_index: 0,
+            zoom: 1.0,
+            request_pending: true,
+        };
+        assert!(poll_language(&mut language));
+        assert!(matches!(
+            language.status,
+            LanguageStatus::Ready(LanguageCardinality::Finite(3))
+        ));
+        assert!(!language.polling());
+        assert!(language.receiver.is_none());
+    }
+
+    #[test]
+    fn canceled_and_stale_parse_results_are_ignored() {
+        let mut state = Workbench {
+            active_parse: Some(ParseJob {
+                id: 7,
+                started: Instant::now(),
+            }),
+            pending_label: Some("input".into()),
+            ..Workbench::default()
+        };
+        let _ = update(&mut state, Message::Parsed(6, Err("stale".into())));
+        assert_eq!(state.active_parse.map(|job| job.id), Some(7));
+        assert!(state.error.is_none());
+        let _ = update(&mut state, Message::CancelParse);
+        assert!(state.active_parse.is_none());
+        assert!(state.pending_label.is_none());
+        let _ = update(&mut state, Message::Parsed(7, Err("late".into())));
+        assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn failed_load_removes_only_the_new_target_window() {
+        let asking = window::Id::unique();
+        let target = window::Id::unique();
+        let mut app = App::default();
+        app.windows.insert(asking, Workbench::default());
+        app.windows.insert(target, Workbench::default());
+        let _ = app_update(
+            &mut app,
+            AppMsg::GrammarLoaded {
+                asking,
+                target,
+                opened_new: true,
+                result: Err("bad grammar".into()),
+            },
+        );
+        assert!(app.windows.contains_key(&asking));
+        assert!(!app.windows.contains_key(&target));
+        assert!(
+            app.windows
+                .get(&asking)
+                .and_then(|window| window.error.as_deref())
+                .is_some_and(|error| error.contains("bad grammar"))
+        );
     }
 
     #[test]
@@ -1878,7 +2010,7 @@ mod tests {
                 InputField {
                     name: "string".into(),
                     value: "words".into(),
-                    id: iced::widget::text_input::Id::unique(),
+                    id: iced::widget::Id::unique(),
                     input_capable: true,
                     non_null_filter_capable: false,
                     require_valid: false,
@@ -1886,7 +2018,7 @@ mod tests {
                 InputField {
                     name: "ft".into(),
                     value: String::new(),
-                    id: iced::widget::text_input::Id::unique(),
+                    id: iced::widget::Id::unique(),
                     input_capable: false,
                     non_null_filter_capable: true,
                     require_valid: true,
@@ -1905,7 +2037,7 @@ mod tests {
             inputs: vec![InputField {
                 name: "ft".into(),
                 value: String::new(),
-                id: iced::widget::text_input::Id::unique(),
+                id: iced::widget::Id::unique(),
                 input_capable: true,
                 non_null_filter_capable: true,
                 require_valid: true,

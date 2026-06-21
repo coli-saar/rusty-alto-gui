@@ -85,8 +85,9 @@ impl<Message> canvas::Program<Message, Theme, Renderer> for TreeScene {
                 size: Pixels::from((13.0 * scale).clamp(9.0, 20.0)),
                 line_height: text::LineHeight::default(),
                 font: Font::with_name("Inter"),
-                horizontal_alignment: alignment::Horizontal::Center,
-                vertical_alignment: alignment::Vertical::Center,
+                max_width: f32::INFINITY,
+                align_x: alignment::Horizontal::Center.into(),
+                align_y: alignment::Vertical::Center,
                 shaping: text::Shaping::Basic,
             });
         }

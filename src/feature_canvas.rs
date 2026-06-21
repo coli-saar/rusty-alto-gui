@@ -53,10 +53,7 @@ impl<Message> canvas::Program<Message, Theme, Renderer> for FeatureStructureScen
                     offset_x + line.from_x * scale,
                     offset_y + line.from_y * scale,
                 ),
-                Point::new(
-                    offset_x + line.to_x * scale,
-                    offset_y + line.to_y * scale,
-                ),
+                Point::new(offset_x + line.to_x * scale, offset_y + line.to_y * scale),
             );
             frame.stroke(
                 &path,
@@ -82,20 +79,18 @@ impl<Message> canvas::Program<Message, Theme, Renderer> for FeatureStructureScen
         for item in &self.layout.texts {
             frame.fill_text(canvas::Text {
                 content: item.text.clone(),
-                position: Point::new(
-                    offset_x + item.x * scale,
-                    offset_y + item.y * scale,
-                ),
+                position: Point::new(offset_x + item.x * scale, offset_y + item.y * scale),
                 color: theme::TEXT,
                 size: Pixels::from((13.0 * scale).clamp(9.0, 22.0)),
                 line_height: text::LineHeight::default(),
                 font: Font::with_name("Inter"),
-                horizontal_alignment: if item.centered {
-                    alignment::Horizontal::Center
+                max_width: f32::INFINITY,
+                align_x: if item.centered {
+                    alignment::Horizontal::Center.into()
                 } else {
-                    alignment::Horizontal::Left
+                    alignment::Horizontal::Left.into()
                 },
-                vertical_alignment: alignment::Vertical::Center,
+                align_y: alignment::Vertical::Center,
                 shaping: text::Shaping::Advanced,
             });
         }

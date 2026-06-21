@@ -7,7 +7,14 @@ description = "A multi-window Iced workbench for rusty-alto"
 license = "Apache-2.0"
 
 [dependencies]
-iced = { version = "0.13.1", features = ["canvas", "tokio"] }
+iced = { version = "0.14.0", default-features = false, features = [
+    "canvas",
+    "crisp",
+    "tiny-skia",
+    "tokio",
+    "wayland",
+    "x11",
+] }
 packed-term-arena = "0.1.0"
 rfd = "0.17.2"
 rusty-alto = { path = "../rusty-alto" }

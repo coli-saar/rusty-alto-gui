@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title">
+  <title id="title">Rusty Alto parse tree</title>
+  <rect x="72" y="72" width="880" height="880" rx="196" fill="rgb(37,107,181)"/>
+  <g fill="none" stroke="rgb(220,238,255)" stroke-width="48" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M512 290v178"/>
+    <path d="M512 468 300 640"/>
+    <path d="M512 468 724 640"/>
+    <path d="M300 640 208 770"/>
+    <path d="M300 640 392 770"/>
+    <path d="M724 640 632 770"/>
+    <path d="M724 640 816 770"/>
+  </g>
+  <g fill="rgb(255,255,255)">
+    <circle cx="512" cy="252" r="74"/>
+    <circle cx="300" cy="620" r="66"/>
+    <circle cx="724" cy="620" r="66"/>
+    <circle cx="208" cy="790" r="56"/>
+    <circle cx="392" cy="790" r="56"/>
+    <circle cx="632" cy="790" r="56"/>
+    <circle cx="816" cy="790" r="56"/>
+  </g>
+</svg>

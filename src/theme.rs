@@ -31,6 +31,7 @@ pub fn panel(_: &Theme) -> container::Style {
         },
         text_color: Some(TEXT),
         shadow: Shadow::default(),
+        ..container::Style::default()
     }
 }
 
@@ -44,6 +45,7 @@ pub fn raised(_: &Theme) -> container::Style {
         },
         text_color: Some(TEXT),
         shadow: Shadow::default(),
+        ..container::Style::default()
     }
 }
 
@@ -121,15 +123,18 @@ pub fn parse_button(theme: &Theme, status: button::Status) -> button::Style {
 pub fn separator(_: &Theme) -> rule::Style {
     rule::Style {
         color: BORDER,
-        width: 1,
         radius: 0.0.into(),
         fill_mode: rule::FillMode::Full,
+        snap: true,
     }
 }
 
 /// One segment of the primary view selector. `corners` rounds only the outer
 /// edge so the two segments read as a single joined toggle.
-pub fn segment(active: bool, corners: [f32; 4]) -> impl Fn(&Theme, button::Status) -> button::Style {
+pub fn segment(
+    active: bool,
+    corners: [f32; 4],
+) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme: &Theme, status: button::Status| {
         let mut style = button::secondary(theme, status);
         let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
