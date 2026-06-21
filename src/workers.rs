@@ -1,11 +1,12 @@
 use crate::model::{
-    ChartDocument, DerivationPresentation, GrammarDocument, RuleRow, TreeEdge, TreeLayout,
-    TreeNode, ViewContent,
+    ChartDocument, DerivationPresentation, GrammarDocument, HeuristicChoice, RuleRow, StrategyChoice,
+    TreeEdge, TreeLayout, TreeNode, ViewContent,
 };
 use packed_term_arena::tree::{Tree, TreeArena};
 use rusty_alto::{
-    Explicit, Irtg, LanguageCardinality, ParseStrategy, RenderedValue, Symbol, TreeValue,
-    parse_irtg,
+    AstarHeuristic, AstarOptions, Explicit, Irtg, LanguageCardinality, LogProbabilityScorer,
+    MaterializationStrategy, ObligatoryLeafTables, RenderedValue, Symbol, TreeValue,
+    UniversalSxHeuristic, parse_irtg,
 };
 use std::{
     collections::HashMap,
@@ -69,20 +70,81 @@ pub fn load_grammar(path: PathBuf) -> Result<GrammarDocument, String> {
 pub fn parse(
     grammar: Arc<Irtg>,
     inputs: Vec<(String, String)>,
-    strategy: ParseStrategy,
+    strategy: StrategyChoice,
+    heuristic: HeuristicChoice,
+    stop_at_first_goal: bool,
 ) -> Result<ChartDocument, String> {
     let start = Instant::now();
     let mut parsed = Vec::with_capacity(inputs.len());
-    for (name, text) in inputs {
+    // Remember the first string-algebra input (its homomorphism + length drive
+    // the SX heuristic).
+    let mut string_input: Option<(String, usize)> = None;
+    for (name, text) in &inputs {
         let interpretation = grammar
-            .interpretation_ref(&name)
+            .interpretation_ref(name)
             .ok_or_else(|| format!("Unknown interpretation {name:?}"))?;
+        if string_input.is_none() && interpretation.algebra_signature().get("*").is_some() {
+            string_input = Some((name.clone(), text.split_whitespace().count()));
+        }
         let value = interpretation
-            .parse_object_erased(&text)
+            .parse_object_erased(text)
             .map_err(|error| error.to_string())?;
         parsed.push(interpretation.input_erased(value));
     }
-    let materialization = strategy.materialization_strategy();
+
+    // A* heuristic tables must outlive the parse, so build them up front.
+    let mut sx_table: Option<UniversalSxHeuristic> = None;
+    let mut oblig: Option<ObligatoryLeafTables> = None;
+    let mut sx_n = 0usize;
+    if strategy == StrategyChoice::Astar && heuristic != HeuristicChoice::Zero {
+        let (name, n) = string_input.ok_or_else(|| {
+            "The SX heuristic needs a string-algebra interpretation input.".to_string()
+        })?;
+        let interpretation = grammar
+            .interpretation_ref(&name)
+            .expect("string interpretation present");
+        let concat = interpretation
+            .algebra_signature()
+            .get("*")
+            .unwrap_or(Symbol(0));
+        sx_n = n;
+        sx_table = Some(UniversalSxHeuristic::new_with(
+            grammar.grammar(),
+            interpretation.homomorphism(),
+            concat,
+            n,
+            &LogProbabilityScorer,
+        ));
+        if heuristic == HeuristicChoice::Sxf {
+            oblig = Some(ObligatoryLeafTables::from_grammar(
+                grammar.grammar(),
+                interpretation.homomorphism(),
+            ));
+        }
+    }
+
+    let materialization = match strategy {
+        StrategyChoice::TopDown => MaterializationStrategy::TopDownCondensed,
+        StrategyChoice::Indexed => MaterializationStrategy::IndexedCondensed,
+        StrategyChoice::Astar => MaterializationStrategy::Astar {
+            heuristic: match heuristic {
+                HeuristicChoice::Zero => AstarHeuristic::Zero,
+                HeuristicChoice::Sx => AstarHeuristic::UniversalSx {
+                    table: sx_table.as_ref().expect("sx table built"),
+                    n: sx_n,
+                },
+                HeuristicChoice::Sxf => AstarHeuristic::UniversalSxF {
+                    table: sx_table.as_ref().expect("sx table built"),
+                    oblig: oblig.as_ref().expect("oblig built"),
+                    n: sx_n,
+                },
+            },
+            options: AstarOptions {
+                stop_at_first_goal,
+                beam: None,
+            },
+        },
+    };
     let result = grammar
         .parse_with(parsed, &materialization)
         .map_err(|error| error.to_string())?;
@@ -347,7 +409,6 @@ fn layout_tree(tree: &TreeValue) -> TreeLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusty_alto::ParseStrategy;
     use std::time::Duration;
 
     const SCFG: &str = r#"
@@ -404,7 +465,9 @@ P -> r12
         let chart = parse(
             document.grammar.clone(),
             vec![("string".into(), "john sleeps".into())],
-            ParseStrategy::TopDownCondensed,
+            StrategyChoice::TopDown,
+            HeuristicChoice::Zero,
+            false,
         )
         .expect("parse example input");
         assert!(!chart.summary.is_empty);
@@ -446,7 +509,9 @@ P -> r12
                 "english".into(),
                 "john watches the woman with the telescope".into(),
             )],
-            ParseStrategy::TopDownCondensed,
+            StrategyChoice::TopDown,
+            HeuristicChoice::Zero,
+            false,
         )
         .expect("parse ambiguous sentence");
         let (tx, rx) = mpsc::channel();

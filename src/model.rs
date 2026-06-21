@@ -1,6 +1,4 @@
-use rusty_alto::{
-    AutomatonSummary, Explicit, InterpretationInfo, Irtg, ParseStrategy, ResolvedRule,
-};
+use rusty_alto::{AutomatonSummary, Explicit, InterpretationInfo, Irtg, ResolvedRule};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,17 +99,6 @@ pub enum StrategyChoice {
 
 impl StrategyChoice {
     pub const ALL: [Self; 3] = [Self::TopDown, Self::Indexed, Self::Astar];
-
-    pub fn to_strategy(self, stop_at_first_goal: bool, beam: Option<f64>) -> ParseStrategy {
-        match self {
-            Self::TopDown => ParseStrategy::TopDownCondensed,
-            Self::Indexed => ParseStrategy::IndexedCondensed,
-            Self::Astar => ParseStrategy::AstarZero {
-                stop_at_first_goal,
-                beam,
-            },
-        }
-    }
 }
 
 impl std::fmt::Display for StrategyChoice {
@@ -119,7 +106,29 @@ impl std::fmt::Display for StrategyChoice {
         f.write_str(match self {
             Self::TopDown => "Top-down condensed",
             Self::Indexed => "Indexed condensed",
-            Self::Astar => "A* (zero heuristic)",
+            Self::Astar => "A*",
+        })
+    }
+}
+
+/// A* heuristic; only meaningful when [`StrategyChoice::Astar`] is selected.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HeuristicChoice {
+    Zero,
+    Sx,
+    Sxf,
+}
+
+impl HeuristicChoice {
+    pub const ALL: [Self; 3] = [Self::Zero, Self::Sx, Self::Sxf];
+}
+
+impl std::fmt::Display for HeuristicChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Zero => "Zero",
+            Self::Sx => "SX",
+            Self::Sxf => "SX + F",
         })
     }
 }

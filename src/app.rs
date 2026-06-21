@@ -1,7 +1,7 @@
 use crate::{
     model::{
-        ChartDocument, DerivationPresentation, DocumentTab, GrammarDocument, InputField,
-        RuleColumn, RuleRow, StrategyChoice,
+        ChartDocument, DerivationPresentation, DocumentTab, GrammarDocument, HeuristicChoice,
+        InputField, RuleColumn, RuleRow, StrategyChoice,
     },
     theme,
     tree_canvas::tree_view,
@@ -195,6 +195,13 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
                             tasks.push(app_update(app, AppMsg::Window(id, Message::OpenGrammar)));
                         }
                     }
+                    macos_menu::NEW_PARSE_ID => {
+                        if let Some(id) =
+                            app.focused.or_else(|| app.windows.keys().next().copied())
+                        {
+                            tasks.push(app_update(app, AppMsg::Window(id, Message::NewParse)));
+                        }
+                    }
                     macos_menu::CLOSE_ALL_ID => {
                         app.windows.clear();
                         tasks.push(iced::exit());
@@ -247,8 +254,14 @@ mod macos_menu {
     };
 
     pub const OPEN_GRAMMAR_ID: &str = "open-grammar";
+    pub const NEW_PARSE_ID: &str = "new-parse";
     pub const CLOSE_ALL_ID: &str = "close-all";
     const APP_NAME: &str = "Rusty Alto";
+
+    /// ⌘ on macOS (this menu is macOS-only).
+    fn cmd(code: Code) -> Accelerator {
+        Accelerator::new(Some(Modifiers::SUPER), code)
+    }
 
     pub fn install() {
         let menu = Menu::new();
@@ -279,7 +292,9 @@ mod macos_menu {
         // File: custom items routed back through muda's event channel; Close
         // Window is the native ⌘W item.
         let file_menu = Submenu::new("File", true);
-        let open_grammar = MenuItem::with_id(OPEN_GRAMMAR_ID, "Open grammar…", true, None);
+        let open_grammar =
+            MenuItem::with_id(OPEN_GRAMMAR_ID, "Open grammar…", true, Some(cmd(Code::KeyO)));
+        let new_parse = MenuItem::with_id(NEW_PARSE_ID, "Parse…", true, Some(cmd(Code::KeyP)));
         let close_all = MenuItem::with_id(
             CLOSE_ALL_ID,
             "Close All Windows",
@@ -291,6 +306,7 @@ mod macos_menu {
         );
         let _ = file_menu.append_items(&[
             &open_grammar,
+            &new_parse,
             &PredefinedMenuItem::separator(),
             &PredefinedMenuItem::close_window(None),
             &close_all,
@@ -374,8 +390,8 @@ pub enum Message {
     SortChart(u64, RuleColumn),
     InputChanged(usize, String),
     StrategyChanged(StrategyChoice),
+    HeuristicChanged(HeuristicChoice),
     StopAtFirstGoal(bool),
-    BeamChanged(String),
     Parse,
     Parsed(Result<ChartDocument, String>),
     PreviousDerivation,
@@ -398,8 +414,8 @@ pub struct Workbench {
     active_tab: DocumentTab,
     inputs: Vec<InputField>,
     strategy: StrategyChoice,
+    heuristic: HeuristicChoice,
     stop_at_first_goal: bool,
-    beam: String,
     pending_label: Option<String>,
     busy: Option<String>,
     error: Option<String>,
@@ -447,8 +463,8 @@ impl Default for Workbench {
             active_tab: DocumentTab::Primary,
             inputs: Vec::new(),
             strategy: StrategyChoice::TopDown,
+            heuristic: HeuristicChoice::Zero,
             stop_at_first_goal: false,
-            beam: String::new(),
             pending_label: None,
             busy: None,
             error: None,
@@ -540,8 +556,8 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
             if let Some(grammar) = &state.grammar {
                 state.inputs = input_fields(grammar);
                 state.strategy = StrategyChoice::TopDown;
+                state.heuristic = HeuristicChoice::Zero;
                 state.stop_at_first_goal = false;
-                state.beam.clear();
                 state.selection = Selection::NewParse;
                 state.active_tab = DocumentTab::Primary;
                 state.error = None;
@@ -570,8 +586,8 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
             }
         }
         Message::StrategyChanged(strategy) => state.strategy = strategy,
+        Message::HeuristicChanged(heuristic) => state.heuristic = heuristic,
         Message::StopAtFirstGoal(value) => state.stop_at_first_goal = value,
-        Message::BeamChanged(value) => state.beam = value,
         Message::Parse => {
             let Some(grammar) = state
                 .grammar
@@ -590,23 +606,16 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
                 state.fail("Enter input for at least one interpretation.".into());
                 return Task::none();
             }
-            let beam = if state.beam.trim().is_empty() {
-                None
-            } else {
-                match state.beam.trim().parse::<f64>() {
-                    Ok(value) if value.is_finite() && value > 0.0 => Some(value),
-                    _ => {
-                        state.fail("Beam must be a positive finite number.".into());
-                        return Task::none();
-                    }
-                }
-            };
             state.pending_label = Some(parse_label(&inputs));
             state.busy = Some("Computing parse chart…".into());
             state.error = None;
-            let strategy = state.strategy.to_strategy(state.stop_at_first_goal, beam);
+            let strategy = state.strategy;
+            let heuristic = state.heuristic;
+            let stop_at_first_goal = state.stop_at_first_goal;
             return Task::perform(
-                async move { workers::parse(grammar, inputs, strategy) },
+                async move {
+                    workers::parse(grammar, inputs, strategy, heuristic, stop_at_first_goal)
+                },
                 Message::Parsed,
             );
         }
@@ -1027,19 +1036,21 @@ fn parse_page(state: &Workbench) -> Element<'_, Message> {
     ]
     .spacing(6);
     if state.strategy == StrategyChoice::Astar {
-        let mut beam = text_input("Optional beam, e.g. 0.001", &state.beam)
-            .on_input(Message::BeamChanged)
-            .padding(9);
-        if state.busy.is_none() {
-            beam = beam.on_submit(Message::Parse);
-        }
         options = options
+            .push(text("Heuristic").size(12).color(theme::MUTED))
+            .push(
+                pick_list(
+                    HeuristicChoice::ALL,
+                    Some(state.heuristic),
+                    Message::HeuristicChanged,
+                )
+                .width(Length::Fill),
+            )
             .push(
                 checkbox("Stop after first goal", state.stop_at_first_goal)
                     .on_toggle(Message::StopAtFirstGoal)
                     .size(15),
-            )
-            .push(beam);
+            );
     }
     let parse_button = button(text(if state.busy.is_some() {
         "Parsing…"
@@ -1604,8 +1615,10 @@ fn display_name(path: &std::path::Path) -> String {
 }
 
 fn keyboard_shortcut(key: Key, modifiers: Modifiers) -> Option<Message> {
+    // `modifiers.command()` is ⌘ on macOS and Ctrl elsewhere.
     match key.as_ref() {
         Key::Character("o") if modifiers.command() => Some(Message::ShortcutOpenGrammar),
+        Key::Character("p") if modifiers.command() => Some(Message::NewParse),
         Key::Named(Named::ArrowLeft) if modifiers.is_empty() => Some(Message::ShortcutPrevious),
         Key::Named(Named::ArrowRight) if modifiers.is_empty() => Some(Message::ShortcutNext),
         _ => None,

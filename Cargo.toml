@@ -1,9 +1,9 @@
 [package]
-name = "rusty-alto-iced"
+name = "rusty-alto-gui"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A single-window Iced workbench for rusty-alto"
+description = "A multi-window Iced workbench for rusty-alto"
 license = "Apache-2.0"
 
 [dependencies]
