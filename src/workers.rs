@@ -383,65 +383,118 @@ where
     L: Fn(Tree) -> String,
     C: Fn(Tree) -> Vec<Tree>,
 {
-    fn visit<L, C>(
-        node: Tree,
-        depth: usize,
-        left: f32,
-        layout: &mut TreeLayout,
-        label_of: &L,
-        children_of: &C,
-    ) -> (usize, f32)
+    struct Subtree {
+        nodes: Vec<TreeNode>,
+        edges: Vec<TreeEdge>,
+        width: f32,
+        height: f32,
+        root_x: f32,
+    }
+
+    fn visit<L, C>(node: Tree, label_of: &L, children_of: &C) -> Subtree
     where
         L: Fn(Tree) -> String,
         C: Fn(Tree) -> Vec<Tree>,
     {
         let label = label_of(node);
         let node_width = (label.chars().count() as f32 * 7.5 + 22.0).clamp(58.0, 220.0);
-        let children = children_of(node);
-        let mut child_centers = Vec::new();
-        let subtree_width = if children.is_empty() {
-            node_width
-        } else {
-            let mut cursor = left;
-            let mut total = 0.0;
-            for (index, child) in children.iter().copied().enumerate() {
-                let (child_index, child_width) =
-                    visit(child, depth + 1, cursor, layout, label_of, children_of);
-                child_centers.push((child_index, layout.nodes[child_index].x));
-                cursor += child_width + TREE_H_GAP;
-                total += child_width + if index > 0 { TREE_H_GAP } else { 0.0 };
-            }
-            total.max(node_width)
-        };
-        let center = child_centers
-            .first()
-            .zip(child_centers.last())
-            .map(|(first, last)| (first.1 + last.1) / 2.0)
-            .unwrap_or(left + subtree_width / 2.0);
-        let index = layout.nodes.len();
-        layout.nodes.push(TreeNode {
-            label,
-            x: center,
-            y: depth as f32 * TREE_V_GAP,
-            width: node_width,
-        });
-        for (child_index, child_x) in child_centers {
-            layout.edges.push(TreeEdge {
-                parent_x: center,
-                parent_y: depth as f32 * TREE_V_GAP + TREE_NODE_HEIGHT,
+        let children = children_of(node)
+            .into_iter()
+            .map(|child| visit(child, label_of, children_of))
+            .collect::<Vec<_>>();
+
+        if children.is_empty() {
+            return Subtree {
+                nodes: vec![TreeNode {
+                    label,
+                    x: node_width / 2.0,
+                    y: 0.0,
+                    width: node_width,
+                }],
+                edges: Vec::new(),
+                width: node_width,
+                height: TREE_NODE_HEIGHT,
+                root_x: node_width / 2.0,
+            };
+        }
+
+        let children_width = children.iter().map(|child| child.width).sum::<f32>()
+            + TREE_H_GAP * children.len().saturating_sub(1) as f32;
+        let mut child_roots = Vec::with_capacity(children.len());
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut cursor = 0.0;
+        let mut height: f32 = 0.0;
+
+        for child in children {
+            let child_root = cursor + child.root_x;
+            child_roots.push(child_root);
+            height = height.max(TREE_V_GAP + child.height);
+            nodes.extend(child.nodes.into_iter().map(|mut child_node| {
+                child_node.x += cursor;
+                child_node.y += TREE_V_GAP;
+                child_node
+            }));
+            edges.extend(child.edges.into_iter().map(|mut child_edge| {
+                child_edge.parent_x += cursor;
+                child_edge.child_x += cursor;
+                child_edge.parent_y += TREE_V_GAP;
+                child_edge.child_y += TREE_V_GAP;
+                child_edge
+            }));
+            cursor += child.width + TREE_H_GAP;
+        }
+
+        let root_x = (child_roots[0] + child_roots[child_roots.len() - 1]) / 2.0;
+        // A wide parent over narrow or asymmetric children can extend beyond
+        // their combined span. Include that overhang in the subtree bounds and
+        // shift all descendants so every declared coordinate is non-negative.
+        let left = (root_x - node_width / 2.0).min(0.0);
+        let right = (root_x + node_width / 2.0).max(children_width);
+        let shift_x = -left;
+        for child_node in &mut nodes {
+            child_node.x += shift_x;
+        }
+        for child_edge in &mut edges {
+            child_edge.parent_x += shift_x;
+            child_edge.child_x += shift_x;
+        }
+        for child_root in &mut child_roots {
+            *child_root += shift_x;
+        }
+        let root_x = root_x + shift_x;
+
+        for child_x in child_roots {
+            edges.push(TreeEdge {
+                parent_x: root_x,
+                parent_y: TREE_NODE_HEIGHT,
                 child_x,
-                child_y: layout.nodes[child_index].y,
+                child_y: TREE_V_GAP,
             });
         }
-        (index, subtree_width)
+        nodes.push(TreeNode {
+            label,
+            x: root_x,
+            y: 0.0,
+            width: node_width,
+        });
+
+        Subtree {
+            nodes,
+            edges,
+            width: right - left,
+            height: height.max(TREE_NODE_HEIGHT),
+            root_x,
+        }
     }
 
-    let mut layout = TreeLayout::default();
-    let (_, width) = visit(root, 0, 0.0, &mut layout, label_of, children_of);
-    layout.width = width + TREE_MARGIN * 2.0;
-    layout.height = layout.nodes.iter().map(|node| node.y).fold(0.0, f32::max)
-        + TREE_NODE_HEIGHT
-        + TREE_MARGIN * 2.0;
+    let subtree = visit(root, label_of, children_of);
+    let mut layout = TreeLayout {
+        nodes: subtree.nodes,
+        edges: subtree.edges,
+        width: subtree.width + TREE_MARGIN * 2.0,
+        height: subtree.height + TREE_MARGIN * 2.0,
+    };
     for node in &mut layout.nodes {
         node.x += TREE_MARGIN;
         node.y += TREE_MARGIN;
@@ -821,6 +874,32 @@ lemma 'hälfe': <vinf_tv>[objcase=dat] {
 }
 "#;
 
+    fn assert_tree_layout_is_bounded(layout: &TreeLayout) {
+        assert_eq!(layout.edges.len() + 1, layout.nodes.len());
+        for node in &layout.nodes {
+            assert!(
+                node.x - node.width / 2.0 >= 0.0,
+                "node {:?} escaped the left layout bound",
+                node.label
+            );
+            assert!(
+                node.x + node.width / 2.0 <= layout.width,
+                "node {:?} escaped the right layout bound",
+                node.label
+            );
+            assert!(node.y >= 0.0);
+            assert!(node.y + TREE_NODE_HEIGHT <= layout.height);
+        }
+        for edge in &layout.edges {
+            for x in [edge.parent_x, edge.child_x] {
+                assert!((0.0..=layout.width).contains(&x));
+            }
+            for y in [edge.parent_y, edge.child_y] {
+                assert!((0.0..=layout.height).contains(&y));
+            }
+        }
+    }
+
     #[test]
     fn loads_parses_and_pages_derivations() {
         let directory = std::env::temp_dir().join(format!("rusty_alto_gui_{}", std::process::id()));
@@ -941,6 +1020,47 @@ VP -> sleeps
     }
 
     #[test]
+    fn tree_layout_bounds_cover_wide_asymmetric_subtrees() {
+        let mut arena = TreeArena::<String>::new();
+        let deep_leaf = arena.add_node("deep".into(), vec![]);
+        let deep = arena.add_node("right".into(), vec![deep_leaf]);
+        let left = arena.add_node("left".into(), vec![]);
+        let narrow_parent = arena.add_node("middle".into(), vec![left, deep]);
+        let other = arena.add_node("x".into(), vec![]);
+        let root = arena.add_node(
+            "a-parent-label-much-wider-than-its-children".into(),
+            vec![narrow_parent, other],
+        );
+        let layout = layout_tree_nodes(root, &|node| arena.get_label(node).clone(), &|node| {
+            arena.get_children(node).to_vec()
+        });
+
+        assert_tree_layout_is_bounded(&layout);
+    }
+
+    #[test]
+    fn feature_structure_primitives_stay_inside_reported_bounds() {
+        let value = FeatureStructure::parse("[left: #x [case: nom], right: #x, open: #y]").unwrap();
+        let layout = layout_feature_structure(&value);
+        for text in &layout.texts {
+            assert!((0.0..=layout.width).contains(&text.x));
+            assert!((0.0..=layout.height).contains(&text.y));
+        }
+        for line in &layout.lines {
+            for x in [line.from_x, line.to_x] {
+                assert!((0.0..=layout.width).contains(&x));
+            }
+            for y in [line.from_y, line.to_y] {
+                assert!((0.0..=layout.height).contains(&y));
+            }
+        }
+        for item in &layout.boxes {
+            assert!(item.x >= 0.0 && item.x + item.width <= layout.width);
+            assert!(item.y >= 0.0 && item.y + item.height <= layout.height);
+        }
+    }
+
+    #[test]
     fn nonempty_ambiguous_chart_delivers_first_language_item() {
         let grammar = Arc::new(parse_irtg(SCFG.as_bytes()).expect("parse SCFG"));
         let chart = parse(
@@ -1008,6 +1128,14 @@ VP -> sleeps
                 other => panic!("expected derivation {index}, got {other:?}"),
             };
             assert_eq!(item.index, index);
+            for view in &item.views {
+                if let Some(term) = &view.term {
+                    assert_tree_layout_is_bounded(term);
+                }
+                if let ValuePresentation::Tree(tree) = &view.value {
+                    assert_tree_layout_is_bounded(tree);
+                }
+            }
             let feature_failed = matches!(
                 &item.views.iter().find(|view| view.name == "ft").unwrap().value,
                 ValuePresentation::Error(error) if !error.trim().is_empty()

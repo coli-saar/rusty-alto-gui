@@ -1,100 +1,132 @@
-use crate::{model::FeatureStructureLayout, theme};
+use crate::{model::FeatureStructureLayout, svg_view};
 use iced::{
-    Element, Font, Length, Pixels, Point, Rectangle, Renderer, Size, Theme, alignment, mouse,
-    widget::{canvas, scrollable, text},
+    Element, Length, Size,
+    widget::{scrollable, svg},
 };
-use std::sync::Arc;
+use std::{fmt::Write, sync::Arc};
 
 pub fn feature_structure_view<Message: 'static>(
     layout: Arc<FeatureStructureLayout>,
     zoom: f32,
 ) -> Element<'static, Message> {
     let scale = zoom.max(0.35);
-    let width = layout.width * scale + 24.0;
-    let height = layout.height * scale + 36.0;
-    scrollable(
-        canvas(FeatureStructureScene { layout, zoom })
-            .width(Length::Fixed(width))
-            .height(Length::Fixed(height)),
+    let natural_width = layout.width + 24.0;
+    let natural_height = layout.height + 36.0;
+    let width = natural_width * scale;
+    let height = natural_height * scale;
+    let image = svg_view::natural_svg(
+        svg::Handle::from_memory(feature_structure_svg(
+            &layout,
+            natural_width,
+            natural_height,
+        )),
+        Size::new(width, height),
+    );
+
+    scrollable(image)
+        .direction(scrollable::Direction::Both {
+            vertical: scrollable::Scrollbar::default(),
+            horizontal: scrollable::Scrollbar::default(),
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+fn feature_structure_svg(layout: &FeatureStructureLayout, width: f32, height: f32) -> Vec<u8> {
+    const OFFSET_X: f32 = 12.0;
+    const OFFSET_Y: f32 = 18.0;
+    let mut svg = String::new();
+    write!(
+        svg,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}">"#
     )
-    .direction(scrollable::Direction::Both {
-        vertical: scrollable::Scrollbar::default(),
-        horizontal: scrollable::Scrollbar::default(),
-    })
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into()
+    .unwrap();
+    svg.push_str(
+        r##"<g fill="none" stroke="#202733" stroke-width="1.1" stroke-linecap="square">"##,
+    );
+    for line in &layout.lines {
+        write!(
+            svg,
+            r#"<line x1="{}" y1="{}" x2="{}" y2="{}"/>"#,
+            OFFSET_X + line.from_x,
+            OFFSET_Y + line.from_y,
+            OFFSET_X + line.to_x,
+            OFFSET_Y + line.to_y,
+        )
+        .unwrap();
+    }
+    for item in &layout.boxes {
+        write!(
+            svg,
+            r#"<rect x="{}" y="{}" width="{}" height="{}"/>"#,
+            OFFSET_X + item.x,
+            OFFSET_Y + item.y,
+            item.width,
+            item.height,
+        )
+        .unwrap();
+    }
+    svg.push_str("</g>");
+    svg.push_str(
+        r##"<g fill="#202733" font-family="Inter, sans-serif" font-size="13" dominant-baseline="middle">"##,
+    );
+    for item in &layout.texts {
+        write!(
+            svg,
+            r#"<text x="{}" y="{}" text-anchor="{}">{}</text>"#,
+            OFFSET_X + item.x,
+            OFFSET_Y + item.y,
+            if item.centered { "middle" } else { "start" },
+            escape_xml(&item.text),
+        )
+        .unwrap();
+    }
+    svg.push_str("</g></svg>");
+    svg.into_bytes()
 }
 
-struct FeatureStructureScene {
-    layout: Arc<FeatureStructureLayout>,
-    zoom: f32,
+fn escape_xml(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
-impl<Message> canvas::Program<Message, Theme, Renderer> for FeatureStructureScene {
-    type State = ();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{FeatureStructureBox, FeatureStructureLine, FeatureStructureText};
 
-    fn draw(
-        &self,
-        _state: &Self::State,
-        renderer: &Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<canvas::Geometry<Renderer>> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
-        let scale = self.zoom.max(0.35);
-        let offset_x = ((bounds.width - self.layout.width * scale) / 2.0).max(12.0);
-        let offset_y = 18.0;
-
-        for line in &self.layout.lines {
-            let path = canvas::Path::line(
-                Point::new(
-                    offset_x + line.from_x * scale,
-                    offset_y + line.from_y * scale,
-                ),
-                Point::new(offset_x + line.to_x * scale, offset_y + line.to_y * scale),
-            );
-            frame.stroke(
-                &path,
-                canvas::Stroke::default()
-                    .with_color(theme::TEXT)
-                    .with_width((1.2 * scale).max(0.8)),
-            );
-        }
-
-        for item in &self.layout.boxes {
-            let path = canvas::Path::rectangle(
-                Point::new(offset_x + item.x * scale, offset_y + item.y * scale),
-                Size::new(item.width * scale, item.height * scale),
-            );
-            frame.stroke(
-                &path,
-                canvas::Stroke::default()
-                    .with_color(theme::TEXT)
-                    .with_width((1.0 * scale).max(0.8)),
-            );
-        }
-
-        for item in &self.layout.texts {
-            frame.fill_text(canvas::Text {
-                content: item.text.clone(),
-                position: Point::new(offset_x + item.x * scale, offset_y + item.y * scale),
-                color: theme::TEXT,
-                size: Pixels::from((13.0 * scale).clamp(9.0, 22.0)),
-                line_height: text::LineHeight::default(),
-                font: Font::with_name("Inter"),
-                max_width: f32::INFINITY,
-                align_x: if item.centered {
-                    alignment::Horizontal::Center.into()
-                } else {
-                    alignment::Horizontal::Left.into()
-                },
-                align_y: alignment::Vertical::Center,
-                shaping: text::Shaping::Advanced,
-            });
-        }
-
-        vec![frame.into_geometry()]
+    #[test]
+    fn svg_contains_every_feature_structure_primitive() {
+        let layout = FeatureStructureLayout {
+            texts: vec![FeatureStructureText {
+                text: "case<&".into(),
+                x: 10.0,
+                y: 12.0,
+                centered: false,
+            }],
+            lines: vec![FeatureStructureLine {
+                from_x: 0.0,
+                from_y: 0.0,
+                to_x: 20.0,
+                to_y: 0.0,
+            }],
+            boxes: vec![FeatureStructureBox {
+                x: 2.0,
+                y: 2.0,
+                width: 10.0,
+                height: 10.0,
+            }],
+            width: 30.0,
+            height: 24.0,
+        };
+        let output = String::from_utf8(feature_structure_svg(&layout, 54.0, 60.0)).unwrap();
+        assert_eq!(output.matches("<text ").count(), 1);
+        assert_eq!(output.matches("<line ").count(), 1);
+        assert_eq!(output.matches("<rect ").count(), 1);
+        assert!(output.contains("case&lt;&amp;"));
     }
 }

@@ -4,6 +4,7 @@ mod feature_canvas;
 mod model;
 #[cfg(target_os = "macos")]
 mod platform_menu;
+mod svg_view;
 mod theme;
 mod tree_canvas;
 mod workers;

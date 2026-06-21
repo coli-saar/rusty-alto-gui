@@ -10,6 +10,8 @@ license = "Apache-2.0"
 iced = { version = "0.14.0", default-features = false, features = [
     "canvas",
     "crisp",
+    "advanced",
+    "svg",
     "tiny-skia",
     "tokio",
     "wayland",
