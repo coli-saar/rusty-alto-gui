@@ -3,6 +3,3 @@
 /.DS_Store
 /assets/icons/RustyAlto.iconset/
 *.log
-
-# Cargo.lock is intentionally not tracked for now; see FUTURE_WORK.md.
-/Cargo.lock

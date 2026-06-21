@@ -19,11 +19,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: rusty-alto-gui
-      - uses: actions/checkout@v4
-        with:
-          repository: coli-saar/rusty-alto
-          ref: 9c3f1a230a2cc9f7329f5da439c17912f977dcb3
-          path: rusty-alto
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -35,18 +30,18 @@ jobs:
         run: cargo fmt --check
       - name: Test
         working-directory: rusty-alto-gui
-        run: cargo test
+        run: cargo test --locked
       - name: Clippy
         working-directory: rusty-alto-gui
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Release build
         working-directory: rusty-alto-gui
-        run: cargo build --release
+        run: cargo build --release --locked
       - name: Reject future-incompatible block dependency
         working-directory: rusty-alto-gui
         shell: bash
         run: |
-          if cargo tree -i block >/dev/null 2>&1; then
+          if cargo tree --locked -i block >/dev/null 2>&1; then
             echo "future-incompatible block dependency is present"
             exit 1
           fi

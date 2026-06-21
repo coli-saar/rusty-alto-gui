@@ -1,8 +1,8 @@
 name: Release packages
 
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
 
 permissions:
   contents: write
@@ -15,44 +15,63 @@ jobs:
         include:
           - os: macos-latest
             formats: app,dmg
-            artifact: macos
+            platform: macos
           - os: windows-latest
-            formats: msi
-            artifact: windows
+            formats: wix
+            platform: windows
           - os: ubuntu-latest
             formats: deb,appimage
-            artifact: linux
+            platform: linux-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.release.tag_name }}
           path: rusty-alto-gui
-      - uses: actions/checkout@v4
-        with:
-          repository: coli-saar/rusty-alto
-          ref: 9c3f1a230a2cc9f7329f5da439c17912f977dcb3
-          path: rusty-alto
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev libfuse2
       - name: Install cargo-packager
-        run: cargo install cargo-packager --locked
+        run: cargo install cargo-packager --version 0.11.8 --locked
       - name: Package
         working-directory: rusty-alto-gui
         run: cargo packager --release --formats ${{ matrix.formats }}
         # Signing/notarization environment variables can be added here once
         # platform credentials are provisioned.
+      - name: Archive standalone binary
+        if: runner.os != 'Windows'
+        working-directory: rusty-alto-gui
+        shell: bash
+        run: |
+          tar -C target/release -czf \
+            "dist/rusty-alto-gui-${{ github.event.release.tag_name }}-${{ matrix.platform }}.tar.gz" \
+            rusty-alto-gui
+      - name: Archive standalone binary
+        if: runner.os == 'Windows'
+        working-directory: rusty-alto-gui
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path target/release/rusty-alto-gui.exe `
+            -DestinationPath "dist/rusty-alto-gui-${{ github.event.release.tag_name }}-${{ matrix.platform }}.zip"
       - name: Smoke-check artifacts
         working-directory: rusty-alto-gui
         shell: bash
         run: test -n "$(find dist -type f -print -quit)"
       - uses: actions/upload-artifact@v4
         with:
-          name: rusty-alto-${{ matrix.artifact }}
-          path: rusty-alto-gui/dist/**
+          name: rusty-alto-gui-${{ matrix.platform }}
+          path: |
+            rusty-alto-gui/dist/*.dmg
+            rusty-alto-gui/dist/*.msi
+            rusty-alto-gui/dist/*.deb
+            rusty-alto-gui/dist/*.AppImage
+            rusty-alto-gui/dist/*.tar.gz
+            rusty-alto-gui/dist/*.zip
+          if-no-files-found: error
 
-  draft-release:
+  attach-assets:
     needs: package
     runs-on: ubuntu-latest
     steps:
@@ -61,9 +80,6 @@ jobs:
           path: artifacts
       - uses: softprops/action-gh-release@v2
         with:
-          draft: true
-          prerelease: false
+          tag_name: ${{ github.event.release.tag_name }}
           files: artifacts/**/*
-          body: |
-            Unsigned first-release artifacts for macOS, Windows, and Linux.
-            Review and smoke-test each native package before publishing.
+          fail_on_unmatched_files: true

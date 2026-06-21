@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "A multi-window Iced workbench for rusty-alto"
 license = "Apache-2.0"
+publish = false
 
 [dependencies]
 iced = { version = "0.14.0", default-features = false, features = [
@@ -19,7 +20,7 @@ iced = { version = "0.14.0", default-features = false, features = [
 ] }
 packed-term-arena = "0.1.0"
 rfd = "0.17.2"
-rusty-alto = { path = "../rusty-alto" }
+rusty-alto = "0.2.0"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 # Native menu bar. A top-of-screen menu bar is a macOS concept (and iced 0.13
@@ -32,6 +33,28 @@ muda = "0.15"
 # ourselves via NSApplication.addWindowsItem. (objc2 versions match muda's.)
 objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSWindow", "NSResponder", "NSMenu"] }
 objc2-foundation = { version = "0.2.2", features = ["NSArray", "NSString"] }
+
+[profile.release]
+# Release artifacts are statically linked desktop applications, so optimize for
+# download size and remove symbols that are not useful to end users.
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[package.metadata.packager]
+product-name = "Rusty Alto"
+identifier = "org.rustyalto.workbench"
+before-packaging-command = "cargo build --release --locked"
+out-dir = "dist"
+icons = [
+    "assets/icons/32x32.png",
+    "assets/icons/128x128.png",
+    "assets/icons/128x128@2x.png",
+    "assets/icons/icon.icns",
+    "assets/icons/icon.ico",
+]
 
 # `cargo bundle` packages a "Rusty Alto.app" whose CFBundleName drives the
 # macOS menu-bar application name. See the macOS notes in the source.
