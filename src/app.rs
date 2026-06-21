@@ -1523,8 +1523,7 @@ fn rule_table<'a>(
     let mut body = Column::new().spacing(0);
     for (index, item) in rows.iter().enumerate() {
         let mut cells = row![
-            container(rule_cell(&item.parent, &item.rhs, mute_spans))
-                .width(Length::FillPortion(rule_portion)),
+            container(rule_cell(item, mute_spans)).width(Length::FillPortion(rule_portion)),
             table_cell_owned(format_weight(item.weight), WEIGHT_PORTION),
         ]
         .spacing(12)
@@ -1569,42 +1568,88 @@ fn rule_table<'a>(
         .into()
 }
 
-/// "parent → rhs" for a rule. On the chart, the `[i,j]` position spans are
-/// muted so the rule structure stands out.
-fn rule_cell<'a>(parent: &str, rhs: &str, mute_spans: bool) -> Element<'a, Message> {
-    let full = format!("{parent}  →  {rhs}");
-    if !mute_spans {
-        return text(full).size(14).into();
+/// "parent → rhs" for a rule. Chart-state components are colored by the
+/// automaton that contributed them: grammar state first, then one component per
+/// decomposition/filter automaton.
+fn rule_cell<'a>(rule: &RuleRow, style_state_parts: bool) -> Element<'a, Message> {
+    if !style_state_parts {
+        return text(format!("{}  →  {}", rule.parent, rule.rhs))
+            .size(14)
+            .into();
     }
+
     let mut spans: Vec<iced::widget::text::Span<'_, ()>> = Vec::new();
-    let mut buf = String::new();
-    let mut buf_muted = false;
-    let mut depth: u32 = 0;
-    for ch in full.chars() {
-        let muted = match ch {
-            '[' => {
-                depth += 1;
-                true
+    push_state_spans(&mut spans, &rule.parent, &rule.parent_parts);
+    push_rule_span(&mut spans, "  →  ", 0);
+    push_rule_span(&mut spans, rule.symbol.clone(), 0);
+    if !rule.children.is_empty() {
+        push_rule_span(&mut spans, "(", 0);
+        for (index, child) in rule.children.iter().enumerate() {
+            if index > 0 {
+                push_rule_span(&mut spans, ", ", 0);
             }
-            ']' => {
-                let was = depth > 0;
-                depth = depth.saturating_sub(1);
-                was
-            }
-            _ => depth > 0,
-        };
-        if !buf.is_empty() && muted != buf_muted {
-            let color = if buf_muted { theme::MUTED } else { theme::TEXT };
-            spans.push(span(std::mem::take(&mut buf)).color(color));
+            push_state_spans(
+                &mut spans,
+                child,
+                rule.child_parts
+                    .get(index)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            );
         }
-        buf_muted = muted;
-        buf.push(ch);
-    }
-    if !buf.is_empty() {
-        let color = if buf_muted { theme::MUTED } else { theme::TEXT };
-        spans.push(span(buf).color(color));
+        push_rule_span(&mut spans, ")", 0);
     }
     rich_text(spans).size(14).into()
+}
+
+fn push_state_spans<'a>(
+    spans: &mut Vec<iced::widget::text::Span<'a, ()>>,
+    display: &str,
+    parts: &[String],
+) {
+    for (text, color_index) in state_text_segments(display, parts) {
+        push_rule_span(spans, text, color_index);
+    }
+}
+
+fn push_rule_span<'a>(
+    spans: &mut Vec<iced::widget::text::Span<'a, ()>>,
+    text: impl Into<String>,
+    color_index: usize,
+) {
+    const PART_COLORS: [iced::Color; 5] = [
+        theme::TEXT,
+        theme::MUTED,
+        theme::ACCENT,
+        theme::STATE_PART_PURPLE,
+        theme::STATE_PART_TEAL,
+    ];
+    spans.push(span(text.into()).color(PART_COLORS[color_index % PART_COLORS.len()]));
+}
+
+fn state_text_segments(display: &str, parts: &[String]) -> Vec<(String, usize)> {
+    if parts.is_empty() {
+        return vec![(display.to_owned(), 0)];
+    }
+
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+    for (index, part) in parts.iter().enumerate() {
+        let Some(relative_start) = display[cursor..].find(part) else {
+            return vec![(display.to_owned(), 0)];
+        };
+        let start = cursor + relative_start;
+        if start > cursor {
+            segments.push((display[cursor..start].to_owned(), index));
+        }
+        let end = start + part.len();
+        segments.push((display[start..end].to_owned(), index));
+        cursor = end;
+    }
+    if cursor < display.len() {
+        segments.push((display[cursor..].to_owned(), 0));
+    }
+    segments
 }
 
 fn format_weight(weight: f64) -> String {
@@ -2085,5 +2130,27 @@ S! -> value
         assert!(!ft.require_valid);
         assert!(string.input_capable);
         assert!(!tree.input_capable);
+    }
+
+    #[test]
+    fn state_text_segments_preserve_arbitrary_display_parts() {
+        assert_eq!(
+            state_text_segments(
+                "NP × [0-2, 3-5] × q7!",
+                &["NP".into(), "[0-2, 3-5]".into(), "q7".into()]
+            ),
+            vec![
+                ("NP".into(), 0),
+                (" × ".into(), 1),
+                ("[0-2, 3-5]".into(), 1),
+                (" × ".into(), 2),
+                ("q7".into(), 2),
+                ("!".into(), 0),
+            ]
+        );
+        assert_eq!(
+            state_text_segments("NP[0-2]", &["NP".into(), "[0-2]".into()]),
+            vec![("NP".into(), 0), ("[0-2]".into(), 1)]
+        );
     }
 }

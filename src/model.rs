@@ -19,6 +19,10 @@ pub enum RuleColumn {
 #[derive(Debug, Clone)]
 pub struct RuleRow {
     pub parent: String,
+    pub parent_parts: Vec<String>,
+    pub symbol: String,
+    pub children: Vec<String>,
+    pub child_parts: Vec<Vec<String>>,
     pub rhs: String,
     pub weight: f64,
     /// Homomorphism term per interpretation, in grammar order.
@@ -27,12 +31,32 @@ pub struct RuleRow {
 
 impl RuleRow {
     pub fn from_resolved(rule: &ResolvedRule) -> Self {
+        Self::from_resolved_with_parts(
+            rule,
+            vec![rule.parent.clone()],
+            rule.children
+                .iter()
+                .cloned()
+                .map(|child| vec![child])
+                .collect(),
+        )
+    }
+
+    pub fn from_resolved_with_parts(
+        rule: &ResolvedRule,
+        parent_parts: Vec<String>,
+        child_parts: Vec<Vec<String>>,
+    ) -> Self {
         Self {
             parent: if rule.parent_is_final {
                 format!("{}!", rule.parent)
             } else {
                 rule.parent.clone()
             },
+            parent_parts,
+            symbol: rule.symbol.clone(),
+            children: rule.children.clone(),
+            child_parts,
             rhs: if rule.children.is_empty() {
                 rule.symbol.clone()
             } else {

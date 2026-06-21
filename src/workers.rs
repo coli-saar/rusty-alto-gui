@@ -179,6 +179,7 @@ pub fn parse_controlled(
         .map_err(|error| error.to_string())?;
     let mut automaton = result.automaton;
     let mut state_names = result.state_names;
+    let mut state_parts = result.state_parts;
     for name in required_valid {
         let filtered = grammar
             .filter_non_null_with_state_origins_controlled(&automaton, &name, &control)
@@ -194,22 +195,47 @@ pub fn parse_controlled(
                 format!("{source_name} × q{filter_state}")
             })
             .collect();
+        state_parts = filtered
+            .state_origins
+            .iter()
+            .map(|(source, filter_state)| {
+                let mut parts = state_parts
+                    .get(source.index())
+                    .cloned()
+                    .unwrap_or_else(|| vec![format!("q{}", source.0)]);
+                parts.push(format!("q{filter_state}"));
+                parts
+            })
+            .collect();
         automaton = filtered.automaton;
     }
     let automaton = Arc::new(automaton);
     let summary = automaton.application_summary();
-    let rules = automaton
-        .resolve_rules(
-            |state| {
-                state_names
+    let resolved = automaton.resolve_rules(
+        |state| {
+            state_names
+                .get(state.index())
+                .cloned()
+                .unwrap_or_else(|| format!("q{}", state.0))
+        },
+        |symbol| grammar.grammar_signature().resolve(symbol).to_owned(),
+    );
+    let rules = resolved
+        .iter()
+        .zip(automaton.rules())
+        .map(|(resolved, rule)| {
+            let parts_for = |state: rusty_alto::StateId| {
+                state_parts
                     .get(state.index())
                     .cloned()
-                    .unwrap_or_else(|| format!("q{}", state.0))
-            },
-            |symbol| grammar.grammar_signature().resolve(symbol).to_owned(),
-        )
-        .iter()
-        .map(RuleRow::from_resolved)
+                    .unwrap_or_else(|| vec![format!("q{}", state.0)])
+            };
+            RuleRow::from_resolved_with_parts(
+                resolved,
+                parts_for(rule.result),
+                rule.children.iter().copied().map(parts_for).collect(),
+            )
+        })
         .collect();
     Ok(ChartDocument {
         automaton,
@@ -956,8 +982,8 @@ VP -> sleeps
         )
         .expect("parse example input");
         assert!(!chart.summary.is_empty);
-        assert!(chart.rules.iter().any(|rule| rule.parent == "NP[0,1]"));
-        assert!(chart.rules.iter().any(|rule| rule.parent == "VP[1,2]"));
+        assert!(chart.rules.iter().any(|rule| rule.parent == "NP[0-1]"));
+        assert!(chart.rules.iter().any(|rule| rule.parent == "VP[1-2]"));
 
         let (tx, rx) = mpsc::channel();
         let worker = start_chart_language_worker(document.grammar, chart.automaton, tx);
@@ -998,6 +1024,44 @@ VP -> sleeps
             string.evaluated.as_ref().unwrap().encode("string").unwrap(),
             "john sleeps"
         );
+    }
+
+    #[test]
+    fn chart_rule_state_names_are_consistent_across_strategies() {
+        let directory =
+            std::env::temp_dir().join(format!("rusty_alto_gui_state_names_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let grammar_path = directory.join("tiny.irtg");
+        std::fs::write(
+            &grammar_path,
+            r#"
+interpretation string: de.up.ling.irtg.algebra.StringAlgebra
+S! -> r(NP, VP)
+  [string] *(?1, ?2)
+NP -> john
+  [string] john
+VP -> sleeps
+  [string] sleeps
+"#,
+        )
+        .unwrap();
+        let grammar = load_grammar(grammar_path).unwrap().grammar;
+
+        for strategy in StrategyChoice::ALL {
+            let chart = parse(
+                grammar.clone(),
+                vec![("string".into(), "john sleeps".into())],
+                Vec::new(),
+                strategy,
+                HeuristicChoice::Zero,
+                false,
+            )
+            .unwrap();
+            assert!(chart.rules.iter().any(|rule| rule.parent == "NP[0-1]"));
+            assert!(chart.rules.iter().any(|rule| rule.parent == "VP[1-2]"));
+            assert!(chart.rules.iter().any(|rule| rule.parent == "S[0-2]!"));
+            assert!(chart.rules.iter().all(|rule| !rule.parent.starts_with('q')));
+        }
     }
 
     #[test]
@@ -1224,6 +1288,13 @@ VP -> sleeps
                 .any(|rule| rule.parent.contains(" × q")),
             "filtered chart labels should preserve source states and append filter states"
         );
+        assert!(
+            filtered
+                .rules
+                .iter()
+                .all(|rule| rule.parent_parts.len() == 2),
+            "the feature filter should be a separate display component"
+        );
         let mut language = filtered.automaton.sorted_language();
         for _ in 0..12 {
             let weighted = language.next().unwrap();
@@ -1236,6 +1307,35 @@ VP -> sleeps
                     .is_ok()
             );
         }
+    }
+
+    #[test]
+    fn tag_input_and_non_null_filter_keep_three_display_parts() {
+        let directory = std::env::temp_dir().join(format!(
+            "rusty_alto_gui_tag_filter_parts_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("shieber.tag");
+        std::fs::write(&path, SHIEBER_TAG).unwrap();
+        let grammar = load_grammar(path).unwrap().grammar;
+        let chart = parse(
+            grammar,
+            vec![("string".into(), "mer es huus aastriiche".into())],
+            vec!["ft".into()],
+            StrategyChoice::TopDown,
+            HeuristicChoice::Zero,
+            false,
+        )
+        .unwrap();
+
+        assert!(!chart.rules.is_empty());
+        assert!(chart.rules.iter().all(|rule| rule.parent_parts.len() == 3));
+        assert!(chart.rules.iter().any(|rule| {
+            rule.parent_parts[1].starts_with('[')
+                && rule.parent_parts[1].ends_with(']')
+                && rule.parent_parts[2].starts_with('q')
+        }));
     }
 
     #[test]

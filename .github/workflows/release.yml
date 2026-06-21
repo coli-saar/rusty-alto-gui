@@ -1,0 +1,69 @@
+name: Release packages
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            formats: app,dmg
+            artifact: macos
+          - os: windows-latest
+            formats: msi
+            artifact: windows
+          - os: ubuntu-latest
+            formats: deb,appimage
+            artifact: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: rusty-alto-gui
+      - uses: actions/checkout@v4
+        with:
+          repository: coli-saar/rusty-alto
+          ref: 9c3f1a230a2cc9f7329f5da439c17912f977dcb3
+          path: rusty-alto
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev libfuse2
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked
+      - name: Package
+        working-directory: rusty-alto-gui
+        run: cargo packager --release --formats ${{ matrix.formats }}
+        # Signing/notarization environment variables can be added here once
+        # platform credentials are provisioned.
+      - name: Smoke-check artifacts
+        working-directory: rusty-alto-gui
+        shell: bash
+        run: test -n "$(find dist -type f -print -quit)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rusty-alto-${{ matrix.artifact }}
+          path: rusty-alto-gui/dist/**
+
+  draft-release:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: false
+          files: artifacts/**/*
+          body: |
+            Unsigned first-release artifacts for macOS, Windows, and Linux.
+            Review and smoke-test each native package before publishing.
