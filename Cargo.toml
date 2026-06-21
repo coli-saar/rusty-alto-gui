@@ -20,6 +20,7 @@ iced = { version = "0.14.0", default-features = false, features = [
 packed-term-arena = "0.1.0"
 rfd = "0.17.2"
 rusty-alto = { path = "../rusty-alto" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 # Native menu bar. A top-of-screen menu bar is a macOS concept (and iced 0.13
 # doesn't expose the per-window handles Windows/Linux menus need), so this is

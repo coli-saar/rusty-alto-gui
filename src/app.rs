@@ -253,6 +253,12 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
                         app.windows.clear();
                         tasks.push(iced::exit());
                     }
+                    crate::platform_menu::KEYBOARD_SHORTCUTS_ID => {
+                        if let Some(id) = app.focused.or_else(|| app.windows.keys().next().copied())
+                        {
+                            tasks.push(app_update(app, AppMsg::Window(id, Message::ShowShortcuts)));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -475,14 +481,20 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
             let stop_at_first_goal = state.stop_at_first_goal && state.constraint_count() <= 1;
             return Task::perform(
                 async move {
-                    workers::parse(
-                        grammar,
-                        inputs,
-                        required_valid,
-                        strategy,
-                        heuristic,
-                        stop_at_first_goal,
-                    )
+                    tokio::task::spawn_blocking(move || {
+                        workers::parse(
+                            grammar,
+                            inputs,
+                            required_valid,
+                            strategy,
+                            heuristic,
+                            stop_at_first_goal,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|error| {
+                        Err(format!("The parser worker stopped unexpectedly: {error}"))
+                    })
                 },
                 move |result| Message::Parsed(job_id, result),
             );
@@ -874,15 +886,12 @@ fn sidebar(state: &Workbench) -> Element<'_, Message> {
             state.selection == Selection::Parse(id),
             Message::SelectParse(id),
         );
-        let remove_button = button(text("×").size(14))
-            .padding([1, 7])
-            .style(theme::quiet_button)
-            .on_press(Message::RemoveParse(id));
-        let remove = container(tooltip(
-            remove_button,
-            text("Remove this parse").size(12),
-            tooltip::Position::Left,
-        ))
+        let remove = container(
+            button(text("×").size(14))
+                .padding([1, 7])
+                .style(theme::quiet_button)
+                .on_press(Message::RemoveParse(id)),
+        )
         .align_right(Length::Fill)
         .center_y(Length::Fill)
         .padding([0, 6]);
@@ -900,16 +909,9 @@ fn sidebar(state: &Workbench) -> Element<'_, Message> {
             parse_button
         };
 
-    let shortcuts = button(text("Keyboard shortcuts  ?").size(12))
-        .width(Length::Fill)
-        .padding([7, 10])
-        .style(theme::quiet_button)
-        .on_press(Message::ShowShortcuts);
-
     container(
         column![
             scrollable(documents.padding([12, 0])).height(Length::Fill),
-            shortcuts,
             parse_button,
         ]
         .padding([12, 10])
@@ -1484,7 +1486,6 @@ fn rule_table<'a>(
     sort: impl Fn(RuleColumn) -> Message + Copy + 'a,
 ) -> Element<'a, Message> {
     let rule_portion = if interpretations.is_empty() { 9 } else { 6 };
-    let table_width = 720.0 + interpretations.len() as f32 * 240.0;
     const WEIGHT_PORTION: u16 = 1;
     const INTERP_PORTION: u16 = 3;
 
@@ -1503,7 +1504,7 @@ fn rule_table<'a>(
     }
     let header = container(header)
         .center_y(34)
-        .width(Length::Fixed(table_width))
+        .width(Length::Fill)
         .style(|_| iced::widget::container::Style {
             background: Some(theme::SURFACE.into()),
             ..Default::default()
@@ -1530,7 +1531,7 @@ fn rule_table<'a>(
         body = body.push(
             container(cells)
                 .center_y(theme::TABLE_ROW_HEIGHT)
-                .width(Length::Fixed(table_width))
+                .width(Length::Fill)
                 .style(move |_| iced::widget::container::Style {
                     background: Some(
                         if index % 2 == 0 {
@@ -1545,24 +1546,17 @@ fn rule_table<'a>(
                 }),
         );
     }
-    let table = column![header, rule::horizontal(1).style(theme::separator), body,]
-        .width(Length::Fixed(table_width));
-    container(
-        scrollable(table)
-            .direction(scrollable::Direction::Both {
-                vertical: scrollable::Scrollbar::default(),
-                horizontal: scrollable::Scrollbar::default(),
-            })
-            .height(Length::Fill),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    // Inset content past the 1px border and clip to the rounded corners so the
-    // zebra rows don't paint over the panel edge.
-    .padding(1)
-    .clip(true)
-    .style(theme::panel)
-    .into()
+    let table =
+        column![header, rule::horizontal(1).style(theme::separator), body,].width(Length::Fill);
+    container(scrollable(table).height(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        // Inset content past the 1px border and clip to the rounded corners so the
+        // zebra rows don't paint over the panel edge.
+        .padding(1)
+        .clip(true)
+        .style(theme::panel)
+        .into()
 }
 
 /// "parent → rhs" for a rule. On the chart, the `[i,j]` position spans are

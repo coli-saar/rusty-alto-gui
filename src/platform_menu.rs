@@ -6,6 +6,7 @@ use muda::{
 pub const OPEN_GRAMMAR_ID: &str = "open-grammar";
 pub const NEW_PARSE_ID: &str = "new-parse";
 pub const CLOSE_ALL_ID: &str = "close-all";
+pub const KEYBOARD_SHORTCUTS_ID: &str = "keyboard-shortcuts";
 const APP_NAME: &str = "Rusty Alto";
 
 fn cmd(code: Code) -> Accelerator {
@@ -69,7 +70,16 @@ pub fn install() {
         &PredefinedMenuItem::bring_all_to_front(None),
     ]);
 
-    let _ = menu.append_items(&[&app_menu, &file_menu, &window_menu]);
+    let help_menu = Submenu::new("Help", true);
+    let shortcuts = MenuItem::with_id(
+        KEYBOARD_SHORTCUTS_ID,
+        "Keyboard Shortcuts",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SHIFT), Code::Slash)),
+    );
+    let _ = help_menu.append(&shortcuts);
+
+    let _ = menu.append_items(&[&app_menu, &file_menu, &window_menu, &help_menu]);
     menu.init_for_nsapp();
     std::mem::forget(menu);
 }
@@ -85,8 +95,8 @@ pub fn refresh_windows_menu() {
 
     if let Some(main_menu) = unsafe { app.mainMenu() } {
         let count = unsafe { main_menu.numberOfItems() };
-        if count > 0
-            && let Some(submenu) = unsafe { main_menu.itemAtIndex(count - 1) }
+        if count > 1
+            && let Some(submenu) = unsafe { main_menu.itemAtIndex(count - 2) }
                 .and_then(|item| unsafe { item.submenu() })
         {
             unsafe { app.setWindowsMenu(Some(&submenu)) };
