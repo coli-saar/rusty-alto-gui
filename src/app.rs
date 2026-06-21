@@ -235,9 +235,11 @@ fn app_subscription(app: &App) -> Subscription<AppMsg> {
     };
     // Route keyboard shortcuts to whichever window currently has focus, and
     // remember the focused window for app-level menu actions (macOS).
-    let events = event::listen_with(|event, _status, id| match event {
+    let events = event::listen_with(|event, status, id| match event {
         Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-            if key == Key::Named(Named::Escape) {
+            if status == event::Status::Captured {
+                None
+            } else if key == Key::Named(Named::Escape) {
                 Some(AppMsg::Window(id, Message::CloseCopyMenu))
             } else {
                 keyboard_shortcut(key, modifiers).map(|message| AppMsg::Window(id, message))
@@ -331,18 +333,6 @@ mod macos_menu {
             &close_all,
         ]);
 
-        // Edit: standard items handled natively by AppKit.
-        let edit_menu = Submenu::new("Edit", true);
-        let _ = edit_menu.append_items(&[
-            &PredefinedMenuItem::undo(None),
-            &PredefinedMenuItem::redo(None),
-            &PredefinedMenuItem::separator(),
-            &PredefinedMenuItem::cut(None),
-            &PredefinedMenuItem::copy(None),
-            &PredefinedMenuItem::paste(None),
-            &PredefinedMenuItem::select_all(None),
-        ]);
-
         // Window: AppKit auto-populates this with the open windows.
         let window_menu = Submenu::new("Window", true);
         let _ = window_menu.append_items(&[
@@ -355,7 +345,10 @@ mod macos_menu {
         // Window is the last submenu; refresh_windows_menu designates the menu
         // actually shown in the bar as the Windows menu (muda's
         // set_as_windows_menu_for_nsapp targets a standalone copy instead).
-        let _ = menu.append_items(&[&app_menu, &file_menu, &edit_menu, &window_menu]);
+        // Do not install AppKit's predefined Edit commands here. They consume
+        // Cmd-C/X/V/A before Iced's canvas-based text inputs receive the key
+        // events, but cannot operate on those non-native text controls.
+        let _ = menu.append_items(&[&app_menu, &file_menu, &window_menu]);
         menu.init_for_nsapp();
 
         // AppKit retains the NSMenu, but keep muda's wrappers alive for the
@@ -408,9 +401,12 @@ pub enum Message {
     SortGrammar(RuleColumn),
     SortChart(u64, RuleColumn),
     InputChanged(usize, String),
+    RequireValidChanged(usize, bool),
     StrategyChanged(StrategyChoice),
     HeuristicChanged(HeuristicChoice),
     StopAtFirstGoal(bool),
+    FocusNext,
+    FocusPrevious,
     Parse,
     Parsed(Result<ChartDocument, String>),
     PreviousDerivation,
@@ -480,7 +476,6 @@ struct LanguageSession {
 enum LanguageStatus {
     Preparing,
     Ready(LanguageCardinality),
-    Error(String),
 }
 
 impl Default for Workbench {
@@ -553,7 +548,6 @@ impl LanguageSession {
             }
             LanguageStatus::Ready(LanguageCardinality::Infinite) => "∞ derivations".into(),
             LanguageStatus::Ready(LanguageCardinality::TooLarge) => "Many derivations".into(),
-            LanguageStatus::Error(error) => format!("Language error: {error}"),
         }
     }
 }
@@ -625,11 +619,28 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
         Message::InputChanged(index, value) => {
             if let Some(field) = state.inputs.get_mut(index) {
                 field.value = value;
+                if !field.value.trim().is_empty() {
+                    field.require_valid = false;
+                }
             }
+            state.disable_unsupported_early_stop();
+        }
+        Message::RequireValidChanged(index, value) => {
+            if let Some(field) = state.inputs.get_mut(index)
+                && field.non_null_filter_capable
+                && field.value.trim().is_empty()
+            {
+                field.require_valid = value;
+            }
+            state.disable_unsupported_early_stop();
         }
         Message::StrategyChanged(strategy) => state.strategy = strategy,
         Message::HeuristicChanged(heuristic) => state.heuristic = heuristic,
-        Message::StopAtFirstGoal(value) => state.stop_at_first_goal = value,
+        Message::StopAtFirstGoal(value) => {
+            state.stop_at_first_goal = value && state.constraint_count() <= 1;
+        }
+        Message::FocusNext => return iced::widget::focus_next(),
+        Message::FocusPrevious => return iced::widget::focus_previous(),
         Message::Parse => {
             let Some(grammar) = state
                 .grammar
@@ -644,19 +655,34 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
                 .filter(|input| !input.value.trim().is_empty())
                 .map(|input| (input.name.clone(), input.value.trim().to_owned()))
                 .collect::<Vec<_>>();
-            if inputs.is_empty() {
-                state.fail("Enter input for at least one interpretation.".into());
+            let required_valid = state
+                .inputs
+                .iter()
+                .filter(|input| input.require_valid && input.value.trim().is_empty())
+                .map(|input| input.name.clone())
+                .collect::<Vec<_>>();
+            if inputs.is_empty() && required_valid.is_empty() {
+                state.fail(
+                    "Enter an interpretation input or require at least one valid value.".into(),
+                );
                 return Task::none();
             }
-            state.pending_label = Some(parse_label(&inputs));
+            state.pending_label = Some(parse_label(&inputs, &required_valid));
             state.busy = Some("Computing parse chart…".into());
             state.error = None;
             let strategy = state.strategy;
             let heuristic = state.heuristic;
-            let stop_at_first_goal = state.stop_at_first_goal;
+            let stop_at_first_goal = state.stop_at_first_goal && state.constraint_count() <= 1;
             return Task::perform(
                 async move {
-                    workers::parse(grammar, inputs, strategy, heuristic, stop_at_first_goal)
+                    workers::parse(
+                        grammar,
+                        inputs,
+                        required_valid,
+                        strategy,
+                        heuristic,
+                        stop_at_first_goal,
+                    )
                 },
                 Message::Parsed,
             );
@@ -797,9 +823,6 @@ fn poll_language(language: &mut LanguageSession) -> bool {
             LanguageEvent::EndOfLanguage(count) => {
                 language.status = LanguageStatus::Ready(LanguageCardinality::Finite(count));
             }
-            LanguageEvent::Error(error) => {
-                language.status = LanguageStatus::Error(error);
-            }
         }
     }
     changed
@@ -903,10 +926,7 @@ fn sidebar(state: &Workbench) -> Element<'_, Message> {
             .width(Length::Fill),
             text(parse.language.sidebar_status())
                 .size(10)
-                .color(match parse.language.status {
-                    LanguageStatus::Error(_) => theme::DANGER,
-                    _ => theme::MUTED,
-                }),
+                .color(theme::MUTED),
         ]
         .spacing(3)
         .padding(iced::Padding {
@@ -1120,16 +1140,39 @@ fn chart_page(parse: &ParseSession) -> Element<'_, Message> {
 fn parse_page(state: &Workbench) -> Element<'_, Message> {
     let mut fields = Column::new().spacing(10);
     for (index, input) in state.inputs.iter().enumerate() {
-        let mut field = text_input("Optional interpretation input", &input.value)
-            .on_input(move |value| Message::InputChanged(index, value))
-            .padding(9)
-            .size(13);
-        if state.busy.is_none() {
-            field = field.on_submit(Message::Parse);
+        let has_exact_input = !input.value.trim().is_empty();
+        let mut row = Column::new()
+            .spacing(5)
+            .push(text(&input.name).size(12).color(theme::MUTED));
+        if input.input_capable {
+            let mut field = text_input("Optional interpretation input", &input.value)
+                .id(input.id.clone())
+                .on_input(move |value| Message::InputChanged(index, value))
+                .on_paste(move |value| Message::InputChanged(index, value))
+                .padding(9)
+                .size(13);
+            if state.busy.is_none() {
+                field = field.on_submit(Message::Parse);
+            }
+            row = row.push(field);
+        } else {
+            row = row.push(
+                text("Output-only interpretation")
+                    .size(11)
+                    .color(theme::MUTED),
+            );
         }
-        fields = fields.push(
-            column![text(&input.name).size(12).color(theme::MUTED), field].spacing(5),
-        );
+        if input.non_null_filter_capable {
+            let checked = has_exact_input || input.require_valid;
+            let can_toggle = state.busy.is_none() && !has_exact_input;
+            let mut validity = checkbox("Require valid value", checked).size(15);
+            if can_toggle {
+                validity =
+                    validity.on_toggle(move |value| Message::RequireValidChanged(index, value));
+            }
+            row = row.push(validity);
+        }
+        fields = fields.push(row);
     }
     let mut options = column![
         text("Parsing algorithm").size(12).color(theme::MUTED),
@@ -1142,6 +1185,11 @@ fn parse_page(state: &Workbench) -> Element<'_, Message> {
     ]
     .spacing(6);
     if state.strategy == StrategyChoice::Astar {
+        let early_stop_supported = state.constraint_count() <= 1;
+        let mut stop = checkbox("Stop after first goal", state.stop_at_first_goal).size(15);
+        if early_stop_supported {
+            stop = stop.on_toggle(Message::StopAtFirstGoal);
+        }
         options = options
             .push(text("Heuristic").size(12).color(theme::MUTED))
             .push(
@@ -1152,11 +1200,14 @@ fn parse_page(state: &Workbench) -> Element<'_, Message> {
                 )
                 .width(Length::Fill),
             )
-            .push(
-                checkbox("Stop after first goal", state.stop_at_first_goal)
-                    .on_toggle(Message::StopAtFirstGoal)
-                    .size(15),
+            .push(stop);
+        if !early_stop_supported {
+            options = options.push(
+                text("Early stopping is unavailable with multiple interpretation constraints.")
+                    .size(11)
+                    .color(theme::MUTED),
             );
+        }
     }
     let parse_button = button(text(if state.busy.is_some() {
         "Parsing…"
@@ -1220,12 +1271,6 @@ fn language_page<'a>(
                 "Initializing the sorted language iterator in the background.",
             ),
         ),
-        (LanguageStatus::Error(error), _) => (
-            "Could not prepare".into(),
-            None,
-            None,
-            message_panel("Could not prepare language", error),
-        ),
         (LanguageStatus::Ready(LanguageCardinality::Finite(0)), _) => (
             "Empty language".into(),
             None,
@@ -1277,12 +1322,17 @@ fn language_page<'a>(
                 value
             };
             let body: Element<'a, Message> = if let Some(term) = &output.term {
-                // A string value only needs its own height; a tree value shares
-                // the panel with the term tree.
-                let (value_height, term_height) = if value_is_structured {
-                    (Length::FillPortion(3), Length::FillPortion(2))
-                } else {
-                    (Length::Shrink, Length::Fill)
+                // Text values only need their content height. Errors need a
+                // definite region: a Fill-height message inside a Shrink
+                // section otherwise collapses to an empty VALUE panel.
+                let (value_height, term_height) = match &output.value {
+                    ValuePresentation::Error(_) => {
+                        (Length::Fixed(132.0), Length::Fill)
+                    }
+                    _ if value_is_structured => {
+                        (Length::FillPortion(3), Length::FillPortion(2))
+                    }
+                    _ => (Length::Shrink, Length::Fill),
                 };
                 container(
                     column![
@@ -1634,6 +1684,19 @@ fn empty_state<'a>(
 }
 
 impl Workbench {
+    fn constraint_count(&self) -> usize {
+        self.inputs
+            .iter()
+            .filter(|input| !input.value.trim().is_empty() || input.require_valid)
+            .count()
+    }
+
+    fn disable_unsupported_early_stop(&mut self) {
+        if self.constraint_count() > 1 {
+            self.stop_at_first_goal = false;
+        }
+    }
+
     /// Apply a loaded grammar (or its error) to this window.
     fn apply_grammar(&mut self, result: Result<GrammarDocument, String>) {
         self.busy = None;
@@ -1713,20 +1776,30 @@ fn input_fields(grammar: &GrammarDocument) -> Vec<InputField> {
     grammar
         .interpretations
         .iter()
-        .filter(|info| info.input_capable)
         .map(|info| InputField {
             name: info.name.clone(),
             value: String::new(),
+            id: iced::widget::text_input::Id::unique(),
+            input_capable: info.input_capable,
+            non_null_filter_capable: info.non_null_filter_capable,
+            require_valid: false,
         })
         .collect()
 }
 
-fn parse_label(inputs: &[(String, String)]) -> String {
-    inputs
+fn parse_label(inputs: &[(String, String)], required_valid: &[String]) -> String {
+    let mut parts = inputs
         .iter()
         .map(|(_, value)| value.as_str())
         .collect::<Vec<_>>()
-        .join(" · ")
+        .join(" · ");
+    for name in required_valid {
+        if !parts.is_empty() {
+            parts.push_str(" · ");
+        }
+        parts.push_str(&format!("{name} defined"));
+    }
+    parts
 }
 
 fn sort_rows(rows: &mut [RuleRow], column: RuleColumn) {
@@ -1748,6 +1821,8 @@ fn keyboard_shortcut(key: Key, modifiers: Modifiers) -> Option<Message> {
     match key.as_ref() {
         Key::Character("o") if modifiers.command() => Some(Message::ShortcutOpenGrammar),
         Key::Character("p") if modifiers.command() => Some(Message::NewParse),
+        Key::Named(Named::Tab) if modifiers.shift() => Some(Message::FocusPrevious),
+        Key::Named(Named::Tab) => Some(Message::FocusNext),
         Key::Named(Named::ArrowLeft) if modifiers.is_empty() => Some(Message::ShortcutPrevious),
         Key::Named(Named::ArrowRight) if modifiers.is_empty() => Some(Message::ShortcutNext),
         _ => None,
@@ -1764,7 +1839,10 @@ mod tests {
             ("english".into(), "john watches".into()),
             ("german".into(), "hans betrachtet".into()),
         ];
-        assert_eq!(parse_label(&inputs), "john watches · hans betrachtet");
+        assert_eq!(
+            parse_label(&inputs, &["ft".into()]),
+            "john watches · hans betrachtet · ft defined"
+        );
     }
 
     #[test]
@@ -1777,5 +1855,96 @@ mod tests {
             keyboard_shortcut(Key::Named(Named::ArrowLeft), Modifiers::empty()),
             Some(Message::ShortcutPrevious)
         ));
+        assert!(matches!(
+            keyboard_shortcut(Key::Named(Named::Tab), Modifiers::empty()),
+            Some(Message::FocusNext)
+        ));
+        assert!(matches!(
+            keyboard_shortcut(Key::Named(Named::Tab), Modifiers::SHIFT),
+            Some(Message::FocusPrevious)
+        ));
+        assert!(
+            keyboard_shortcut(Key::Character("a".into()), Modifiers::COMMAND).is_none(),
+            "Cmd/Ctrl-A must reach the focused text input for select-all"
+        );
+    }
+
+    #[test]
+    fn multiple_constraints_disable_astar_early_stop() {
+        let mut state = Workbench {
+            strategy: StrategyChoice::Astar,
+            stop_at_first_goal: true,
+            inputs: vec![
+                InputField {
+                    name: "string".into(),
+                    value: "words".into(),
+                    id: iced::widget::text_input::Id::unique(),
+                    input_capable: true,
+                    non_null_filter_capable: false,
+                    require_valid: false,
+                },
+                InputField {
+                    name: "ft".into(),
+                    value: String::new(),
+                    id: iced::widget::text_input::Id::unique(),
+                    input_capable: false,
+                    non_null_filter_capable: true,
+                    require_valid: true,
+                },
+            ],
+            ..Workbench::default()
+        };
+        assert_eq!(state.constraint_count(), 2);
+        state.disable_unsupported_early_stop();
+        assert!(!state.stop_at_first_goal);
+    }
+
+    #[test]
+    fn exact_input_is_one_constraint_and_clears_redundant_validity() {
+        let mut state = Workbench {
+            inputs: vec![InputField {
+                name: "ft".into(),
+                value: String::new(),
+                id: iced::widget::text_input::Id::unique(),
+                input_capable: true,
+                non_null_filter_capable: true,
+                require_valid: true,
+            }],
+            ..Workbench::default()
+        };
+        let _ = update(&mut state, Message::InputChanged(0, "[case: nom]".into()));
+        assert_eq!(state.constraint_count(), 1);
+        assert!(!state.inputs[0].require_valid);
+    }
+
+    #[test]
+    fn parsing_rows_include_output_only_and_filter_capable_interpretations() {
+        let directory =
+            std::env::temp_dir().join(format!("rusty_alto_gui_rows_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("rows.irtg");
+        std::fs::write(
+            &path,
+            r#"
+interpretation string: de.up.ling.irtg.algebra.StringAlgebra
+interpretation tree: de.up.ling.irtg.algebra.TreeWithAritiesAlgebra
+interpretation ft: de.up.ling.irtg.algebra.FeatureStructureAlgebra
+S! -> value
+  [string] word
+  [tree] word_0
+  [ft] "[case: nom]"
+"#,
+        )
+        .unwrap();
+        let document = workers::load_grammar(path).unwrap();
+        let rows = input_fields(&document);
+        assert_eq!(rows.len(), 3);
+        let ft = rows.iter().find(|row| row.name == "ft").unwrap();
+        let string = rows.iter().find(|row| row.name == "string").unwrap();
+        let tree = rows.iter().find(|row| row.name == "tree").unwrap();
+        assert!(ft.non_null_filter_capable);
+        assert!(!ft.require_valid);
+        assert!(string.input_capable);
+        assert!(!tree.input_capable);
     }
 }

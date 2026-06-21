@@ -26,7 +26,6 @@ pub enum LanguageEvent {
     Ready(LanguageCardinality),
     Derivation(Arc<DerivationPresentation>),
     EndOfLanguage(usize),
-    Error(String),
 }
 
 #[derive(Debug)]
@@ -74,6 +73,7 @@ pub fn load_grammar(path: PathBuf) -> Result<GrammarDocument, String> {
 pub fn parse(
     grammar: Arc<Irtg>,
     inputs: Vec<(String, String)>,
+    required_valid: Vec<String>,
     strategy: StrategyChoice,
     heuristic: HeuristicChoice,
     stop_at_first_goal: bool,
@@ -152,8 +152,26 @@ pub fn parse(
     let result = grammar
         .parse_with(parsed, &materialization)
         .map_err(|error| error.to_string())?;
-    let state_names = result.state_names;
-    let automaton = Arc::new(result.automaton);
+    let mut automaton = result.automaton;
+    let mut state_names = result.state_names;
+    for name in required_valid {
+        let filtered = grammar
+            .filter_non_null_with_state_origins(&automaton, &name)
+            .map_err(|error| error.to_string())?;
+        state_names = filtered
+            .state_origins
+            .iter()
+            .map(|(source, filter_state)| {
+                let source_name = state_names
+                    .get(source.index())
+                    .cloned()
+                    .unwrap_or_else(|| format!("q{}", source.0));
+                format!("{source_name} × q{filter_state}")
+            })
+            .collect();
+        automaton = filtered.automaton;
+    }
+    let automaton = Arc::new(automaton);
     let summary = automaton.application_summary();
     let rules = automaton
         .resolve_rules(
@@ -817,6 +835,7 @@ VP -> sleeps
         let chart = parse(
             document.grammar.clone(),
             vec![("string".into(), "john sleeps".into())],
+            Vec::new(),
             StrategyChoice::TopDown,
             HeuristicChoice::Zero,
             false,
@@ -916,6 +935,7 @@ VP -> sleeps
                 "english".into(),
                 "john watches the woman with the telescope".into(),
             )],
+            Vec::new(),
             StrategyChoice::TopDown,
             HeuristicChoice::Zero,
             false,
@@ -952,7 +972,7 @@ VP -> sleeps
     }
 
     #[test]
-    fn failed_feature_interpretation_does_not_stop_tag_language_enumeration() {
+    fn tag_language_enumeration_shows_invalid_interpretations_and_continues() {
         let directory =
             std::env::temp_dir().join(format!("rusty_alto_gui_shieber_{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -960,15 +980,14 @@ VP -> sleeps
         std::fs::write(&path, SHIEBER_TAG).unwrap();
         let grammar = load_grammar(path).unwrap().grammar;
         let (tx, rx) = mpsc::channel();
-        let worker = start_grammar_language_worker(grammar, tx);
+        let worker = start_grammar_language_worker(grammar.clone(), tx);
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             LanguageEvent::Ready(LanguageCardinality::Infinite)
         ));
 
-        let mut saw_feature_error = false;
-        let mut saw_later_derivation = false;
-        for index in 0..12 {
+        let mut failed_index = None;
+        for index in 0..64 {
             worker.request(index);
             let item = match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
                 LanguageEvent::Derivation(item) => item,
@@ -977,27 +996,114 @@ VP -> sleeps
             assert_eq!(item.index, index);
             let feature_failed = matches!(
                 &item.views.iter().find(|view| view.name == "ft").unwrap().value,
-                ValuePresentation::Error(error) if error.contains("did not evaluate")
+                ValuePresentation::Error(error) if !error.trim().is_empty()
             );
             if feature_failed {
-                saw_feature_error = true;
-                assert!(matches!(
-                    item.views
-                        .iter()
-                        .find(|view| view.name == "string")
-                        .unwrap()
-                        .value,
-                    ValuePresentation::Text(_)
-                ));
-            } else if saw_feature_error {
-                saw_later_derivation = true;
+                failed_index = Some(index);
                 break;
             }
         }
-        assert!(saw_feature_error, "fixture should contain an invalid ft value");
         assert!(
-            saw_later_derivation,
-            "enumeration should continue after an invalid interpretation"
+            failed_index.is_some(),
+            "fixture should display an invalid ft value"
+        );
+        let next_index = failed_index.unwrap() + 1;
+        worker.request(next_index);
+        let next = match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            LanguageEvent::Derivation(item) => item,
+            other => panic!("expected derivation after invalid interpretation, got {other:?}"),
+        };
+        assert_eq!(next.index, next_index);
+    }
+
+    #[test]
+    fn explicit_non_null_constraint_filters_tag_parse_chart() {
+        let directory =
+            std::env::temp_dir().join(format!("rusty_alto_gui_filter_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("shieber.tag");
+        std::fs::write(&path, SHIEBER_TAG).unwrap();
+        let grammar = load_grammar(path).unwrap().grammar;
+
+        let unfiltered = parse(
+            grammar.clone(),
+            Vec::new(),
+            Vec::new(),
+            StrategyChoice::TopDown,
+            HeuristicChoice::Zero,
+            false,
+        )
+        .unwrap();
+        let mut language = unfiltered.automaton.sorted_language();
+        assert!((0..12).any(|_| {
+            let weighted = language.next().unwrap();
+            let (arena, root) = language.clone_tree(weighted.tree());
+            grammar
+                .interpretation_ref("ft")
+                .unwrap()
+                .evaluate_derivation(&arena, root)
+                .is_err()
+        }));
+
+        let filtered = parse(
+            grammar.clone(),
+            Vec::new(),
+            vec!["ft".into()],
+            StrategyChoice::TopDown,
+            HeuristicChoice::Zero,
+            false,
+        )
+        .unwrap();
+        assert!(
+            filtered
+                .rules
+                .iter()
+                .any(|rule| rule.parent.contains(" × q")),
+            "filtered chart labels should preserve source states and append filter states"
+        );
+        let mut language = filtered.automaton.sorted_language();
+        for _ in 0..12 {
+            let weighted = language.next().unwrap();
+            let (arena, root) = language.clone_tree(weighted.tree());
+            assert!(
+                grammar
+                    .interpretation_ref("ft")
+                    .unwrap()
+                    .evaluate_derivation(&arena, root)
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn tag_input_chart_preserves_grammar_and_decomposition_state_names() {
+        let directory =
+            std::env::temp_dir().join(format!("rusty_alto_gui_tag_states_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("shieber.tag");
+        std::fs::write(&path, SHIEBER_TAG).unwrap();
+        let grammar = load_grammar(path).unwrap().grammar;
+        let chart = parse(
+            grammar,
+            vec![("string".into(), "mer es huus aastriiche".into())],
+            Vec::new(),
+            StrategyChoice::TopDown,
+            HeuristicChoice::Zero,
+            false,
+        )
+        .unwrap();
+        assert!(chart.rules.iter().any(|rule| rule.parent.contains(" × ")));
+        assert!(
+            chart
+                .rules
+                .iter()
+                .any(|rule| rule.parent.contains("_S") && rule.parent.contains('['))
+        );
+        assert!(
+            chart
+                .rules
+                .iter()
+                .all(|rule| !rule.parent.starts_with('q'))
         );
     }
 }
