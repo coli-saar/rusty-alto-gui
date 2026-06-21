@@ -149,11 +149,15 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
         }
         AppMsg::WindowOpened(id) => {
             // Install the native menu bar once, now that NSApp is running on the
-            // main thread (this update runs on the winit/main thread).
+            // main thread (this update runs on the winit/main thread), and add
+            // the new window to the Window menu.
             #[cfg(target_os = "macos")]
-            if !app.menu_installed {
-                app.menu_installed = true;
-                macos_menu::install();
+            {
+                if !app.menu_installed {
+                    app.menu_installed = true;
+                    macos_menu::install();
+                }
+                macos_menu::refresh_windows_menu();
             }
             window::gain_focus(id)
         }
@@ -221,6 +225,8 @@ fn app_subscription(app: &App) -> Subscription<AppMsg> {
         _ => None,
     });
     let closes = window::close_requests().map(AppMsg::CloseWindow);
+    // `mut` is only used on macOS, where the menu poll is pushed below.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut subscriptions = vec![polling, events, closes];
     // Drain native menu activations (Open grammar / Close All Windows).
     #[cfg(target_os = "macos")]
@@ -311,13 +317,48 @@ mod macos_menu {
             &PredefinedMenuItem::bring_all_to_front(None),
         ]);
 
+        // Window is the last submenu; refresh_windows_menu designates the menu
+        // actually shown in the bar as the Windows menu (muda's
+        // set_as_windows_menu_for_nsapp targets a standalone copy instead).
         let _ = menu.append_items(&[&app_menu, &file_menu, &edit_menu, &window_menu]);
         menu.init_for_nsapp();
-        window_menu.set_as_windows_menu_for_nsapp();
 
         // AppKit retains the NSMenu, but keep muda's wrappers alive for the
         // process lifetime so the menu isn't torn down.
         std::mem::forget(menu);
+    }
+
+    /// Point NSApp.windowsMenu at the visible "Window" submenu and register the
+    /// current windows. AppKit doesn't auto-track winit's windows, so we add
+    /// them; it then keeps their titles in sync and removes them on close.
+    /// `addWindowsItem` ignores duplicates, so re-running is safe.
+    pub fn refresh_windows_menu() {
+        use objc2_app_kit::NSApplication;
+        use objc2_foundation::MainThreadMarker;
+
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let app = NSApplication::sharedApplication(mtm);
+
+        // The Window submenu shown in the menu bar is the last item we appended.
+        if let Some(main_menu) = unsafe { app.mainMenu() } {
+            let count = unsafe { main_menu.numberOfItems() };
+            if count > 0 {
+                if let Some(submenu) = unsafe { main_menu.itemAtIndex(count - 1) }
+                    .and_then(|item| unsafe { item.submenu() })
+                {
+                    unsafe { app.setWindowsMenu(Some(&submenu)) };
+                }
+            }
+        }
+
+        let windows = app.windows();
+        for i in 0..windows.count() {
+            let window = unsafe { windows.objectAtIndex(i) };
+            let title = window.title();
+            unsafe { app.addWindowsItem_title_filename(&window, &title, false) };
+        }
     }
 }
 

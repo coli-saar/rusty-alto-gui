@@ -18,6 +18,10 @@ rusty-alto = { path = "../../rusty-alto" }
 # platforms later means adding the dep + an init call rather than a rewrite.
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.15"
+# AppKit doesn't auto-track winit's windows in the Window menu, so we add them
+# ourselves via NSApplication.addWindowsItem. (objc2 versions match muda's.)
+objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSWindow", "NSResponder", "NSMenu"] }
+objc2-foundation = { version = "0.2.2", features = ["NSArray", "NSString"] }
 
 # `cargo bundle` packages a "Rusty Alto.app" whose CFBundleName drives the
 # macOS menu-bar application name. See the macOS notes in the source.
