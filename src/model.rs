@@ -1,4 +1,7 @@
-use rusty_alto::{AutomatonSummary, Explicit, InterpretationInfo, Irtg, ResolvedRule};
+use rusty_alto::{
+    AutomatonSummary, CodecMetadata, EvaluatedAlgebraValue, Explicit, InterpretationInfo, Irtg,
+    ResolvedRule,
+};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,9 +163,53 @@ pub struct TreeEdge {
 #[derive(Debug, Clone, Default)]
 pub struct ViewContent {
     pub name: String,
-    pub value: String,
     pub term: Option<Arc<TreeLayout>>,
-    pub tree: Option<Arc<TreeLayout>>,
+    pub value: ValuePresentation,
+    pub evaluated: Option<Arc<EvaluatedAlgebraValue>>,
+    pub codecs: Vec<CodecMetadata>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum ValuePresentation {
+    #[default]
+    Empty,
+    Error(String),
+    Text(String),
+    Tree(Arc<TreeLayout>),
+    FeatureStructure(Arc<FeatureStructureLayout>),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FeatureStructureLayout {
+    pub texts: Vec<FeatureStructureText>,
+    pub lines: Vec<FeatureStructureLine>,
+    pub boxes: Vec<FeatureStructureBox>,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeatureStructureText {
+    pub text: String,
+    pub x: f32,
+    pub y: f32,
+    pub centered: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FeatureStructureLine {
+    pub from_x: f32,
+    pub from_y: f32,
+    pub to_x: f32,
+    pub to_y: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FeatureStructureBox {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
 }
 
 #[derive(Debug, Clone, Default)]

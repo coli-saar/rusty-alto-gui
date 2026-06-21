@@ -1,4 +1,5 @@
 mod app;
+mod feature_canvas;
 mod model;
 mod theme;
 mod tree_canvas;

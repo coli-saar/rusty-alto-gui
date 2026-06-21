@@ -10,7 +10,7 @@ license = "Apache-2.0"
 iced = { version = "0.13.1", features = ["canvas", "tokio"] }
 packed-term-arena = "0.1.0"
 rfd = "0.17.2"
-rusty-alto = { path = "../../rusty-alto" }
+rusty-alto = { path = "../rusty-alto" }
 
 # Native menu bar. A top-of-screen menu bar is a macOS concept (and iced 0.13
 # doesn't expose the per-window handles Windows/Linux menus need), so this is
@@ -30,4 +30,3 @@ name = "Rusty Alto"
 identifier = "org.rustyalto.workbench"
 short_description = "A single-window Iced workbench for rusty-alto"
 category = "public.app-category.developer-tools"
-

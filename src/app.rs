@@ -1,22 +1,26 @@
 use crate::{
+    feature_canvas::feature_structure_view,
     model::{
         ChartDocument, DerivationPresentation, DocumentTab, GrammarDocument, HeuristicChoice,
-        InputField, RuleColumn, RuleRow, StrategyChoice,
+        InputField, RuleColumn, RuleRow, StrategyChoice, ValuePresentation,
     },
     theme,
     tree_canvas::tree_view,
     workers::{self, LanguageEvent, LanguageWorker},
 };
 use iced::{
-    Alignment, Element, Event, Length, Subscription, Task, event,
+    Alignment, Element, Event, Length, Point, Subscription, Task, clipboard, event, mouse,
     keyboard::{Key, Modifiers, key::Named},
     widget::{
         Column, Row, button, checkbox, column, container, horizontal_rule, horizontal_space,
-        pick_list, rich_text, row, scrollable, span, stack, text, text_input, vertical_rule,
+        mouse_area, pick_list, rich_text, row, scrollable, span, stack, text, text_input,
+        vertical_rule, vertical_space,
     },
     window,
 };
-use rusty_alto::LanguageCardinality;
+use rusty_alto::{
+    CodecMetadata, EvaluatedAlgebraValue, InputCodecRegistry, Irtg, LanguageCardinality,
+};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -102,16 +106,24 @@ fn app_view(app: &App, id: window::Id) -> Element<'_, AppMsg> {
 fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
     match message {
         // Opening a grammar is an app-level action: it may spawn a new window.
-        AppMsg::Window(id, Message::OpenGrammar | Message::ShortcutOpenGrammar) => Task::perform(
-            async {
-                rfd::AsyncFileDialog::new()
-                    .add_filter("IRTG grammar", &["irtg"])
+        AppMsg::Window(id, Message::OpenGrammar | Message::ShortcutOpenGrammar) => {
+            let extensions = InputCodecRegistry::standard()
+                .codecs_for::<Irtg>()
+                .iter()
+                .filter_map(|codec| codec.metadata().extension)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            Task::perform(
+                async move {
+                    rfd::AsyncFileDialog::new()
+                    .add_filter("IRTG grammars", &extensions)
                     .pick_file()
                     .await
                     .map(|handle| handle.path().to_owned())
-            },
-            move |path| AppMsg::GrammarPicked(id, path),
-        ),
+                },
+                move |path| AppMsg::GrammarPicked(id, path),
+            )
+        }
         AppMsg::Window(id, message) => match app.windows.get_mut(&id) {
             Some(window) => update(window, message).map(move |m| AppMsg::Window(id, m)),
             None => Task::none(),
@@ -225,7 +237,14 @@ fn app_subscription(app: &App) -> Subscription<AppMsg> {
     // remember the focused window for app-level menu actions (macOS).
     let events = event::listen_with(|event, _status, id| match event {
         Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-            keyboard_shortcut(key, modifiers).map(|message| AppMsg::Window(id, message))
+            if key == Key::Named(Named::Escape) {
+                Some(AppMsg::Window(id, Message::CloseCopyMenu))
+            } else {
+                keyboard_shortcut(key, modifiers).map(|message| AppMsg::Window(id, message))
+            }
+        }
+        Event::Mouse(mouse::Event::CursorMoved { position }) => {
+            Some(AppMsg::Window(id, Message::CursorMoved(position)))
         }
         #[cfg(target_os = "macos")]
         Event::Window(window::Event::Focused) => Some(AppMsg::WindowFocused(id)),
@@ -403,6 +422,10 @@ pub enum Message {
     ShortcutOpenGrammar,
     ShortcutPrevious,
     ShortcutNext,
+    CursorMoved(Point),
+    OpenCopyMenu(Arc<EvaluatedAlgebraValue>, Vec<CodecMetadata>),
+    CloseCopyMenu,
+    CopyWithCodec(String),
 }
 
 pub struct Workbench {
@@ -419,6 +442,14 @@ pub struct Workbench {
     pending_label: Option<String>,
     busy: Option<String>,
     error: Option<String>,
+    cursor_position: Point,
+    copy_menu: Option<CopyMenu>,
+}
+
+struct CopyMenu {
+    position: Point,
+    value: Arc<EvaluatedAlgebraValue>,
+    codecs: Vec<CodecMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -468,6 +499,8 @@ impl Default for Workbench {
             pending_label: None,
             busy: None,
             error: None,
+            cursor_position: Point::ORIGIN,
+            copy_menu: None,
         }
     }
 }
@@ -526,6 +559,15 @@ impl LanguageSession {
 }
 
 fn update(state: &mut Workbench, message: Message) -> Task<Message> {
+    if !matches!(
+        message,
+        Message::CursorMoved(_)
+            | Message::OpenCopyMenu(_, _)
+            | Message::CloseCopyMenu
+            | Message::CopyWithCodec(_)
+    ) {
+        state.copy_menu = None;
+    }
     match message {
         // Opening a grammar is handled at the app level (it may open a window).
         Message::OpenGrammar | Message::ShortcutOpenGrammar => {}
@@ -699,16 +741,38 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
                 return update(state, Message::NextDerivation);
             }
         }
+        Message::CursorMoved(position) => state.cursor_position = position,
+        Message::OpenCopyMenu(value, codecs) => {
+            state.copy_menu = Some(CopyMenu {
+                position: state.cursor_position,
+                value,
+                codecs,
+            });
+        }
+        Message::CloseCopyMenu => state.copy_menu = None,
+        Message::CopyWithCodec(codec_name) => {
+            let encoded = state
+                .copy_menu
+                .as_ref()
+                .map(|menu| menu.value.encode(&codec_name));
+            state.copy_menu = None;
+            match encoded {
+                Some(Ok(text)) => return clipboard::write(text),
+                Some(Err(error)) => state.fail(format!("Could not copy value: {error}")),
+                None => {}
+            }
+        }
     }
     Task::none()
 }
 
-fn poll_language(language: &mut LanguageSession) {
+fn poll_language(language: &mut LanguageSession) -> bool {
     let events = language
         .receiver
         .as_ref()
         .map(|receiver| receiver.try_iter().take(32).collect::<Vec<_>>())
         .unwrap_or_default();
+    let changed = !events.is_empty();
     for event in events {
         match event {
             LanguageEvent::Ready(size) => {
@@ -738,16 +802,58 @@ fn poll_language(language: &mut LanguageSession) {
             }
         }
     }
+    changed
 }
 
 fn view(state: &Workbench) -> Element<'_, Message> {
     let body = row![sidebar(state), vertical_rule(1), workspace(state)].height(Length::Fill);
 
-    container(column![body, status_bar(state)])
+    let content = container(column![body, status_bar(state)])
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(theme::workspace)
-        .into()
+        .style(theme::workspace);
+    if let Some(menu) = &state.copy_menu {
+        stack![content, copy_menu_overlay(menu)].into()
+    } else {
+        content.into()
+    }
+}
+
+fn copy_menu_overlay(menu: &CopyMenu) -> Element<'_, Message> {
+    let dismiss = mouse_area(
+        container(horizontal_space())
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .on_press(Message::CloseCopyMenu)
+    .on_right_press(Message::CloseCopyMenu);
+
+    let mut items = Column::new()
+        .spacing(2)
+        .push(text("COPY VALUE").size(10).color(theme::MUTED));
+    for codec in &menu.codecs {
+        items = items.push(
+            button(text(format!("Copy as {}", codec.description)).size(13))
+                .padding([7, 10])
+                .width(Length::Fill)
+                .style(theme::quiet_button)
+                .on_press(Message::CopyWithCodec(codec.name.to_owned())),
+        );
+    }
+    let menu_panel = container(items)
+        .width(Length::Fixed(250.0))
+        .padding(8)
+        .style(theme::raised);
+    let positioned = column![
+        vertical_space().height(Length::Fixed(menu.position.y + 4.0)),
+        row![
+            horizontal_space().width(Length::Fixed(menu.position.x + 4.0)),
+            menu_panel
+        ]
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
+    stack![dismiss, positioned].into()
 }
 
 fn sidebar(state: &Workbench) -> Element<'_, Message> {
@@ -1143,18 +1249,37 @@ fn language_page<'a>(
                 .output_index
                 .min(derivation.views.len().saturating_sub(1));
             let output = &derivation.views[output_index];
-            let value_is_tree = output.tree.is_some();
-            let value: Element<'a, Message> = if let Some(layout) = &output.tree {
-                tree_view(layout.clone(), language.zoom)
-            } else {
-                container(text(&output.value).size(15))
+            let value_is_structured = matches!(
+                output.value,
+                ValuePresentation::Tree(_) | ValuePresentation::FeatureStructure(_)
+            );
+            let value: Element<'a, Message> = match &output.value {
+                ValuePresentation::Empty => horizontal_space().into(),
+                ValuePresentation::Error(error) => {
+                    message_panel("Interpretation did not evaluate", error)
+                }
+                ValuePresentation::Text(value) => container(text(value).size(15))
                     .width(Length::Fill)
+                    .into(),
+                ValuePresentation::Tree(layout) => tree_view(layout.clone(), language.zoom),
+                ValuePresentation::FeatureStructure(layout) => {
+                    feature_structure_view(layout.clone(), language.zoom)
+                }
+            };
+            let value = if let Some(evaluated) = &output.evaluated {
+                mouse_area(value)
+                    .on_right_press(Message::OpenCopyMenu(
+                        evaluated.clone(),
+                        output.codecs.clone(),
+                    ))
                     .into()
+            } else {
+                value
             };
             let body: Element<'a, Message> = if let Some(term) = &output.term {
                 // A string value only needs its own height; a tree value shares
                 // the panel with the term tree.
-                let (value_height, term_height) = if value_is_tree {
+                let (value_height, term_height) = if value_is_structured {
                     (Length::FillPortion(3), Length::FillPortion(2))
                 } else {
                     (Length::Shrink, Length::Fill)
@@ -1532,11 +1657,15 @@ impl Workbench {
 
     /// Drain background language events for this window's grammar and parses.
     fn poll(&mut self) {
+        let mut changed = false;
         if let Some(language) = &mut self.grammar_language {
-            poll_language(language);
+            changed |= poll_language(language);
         }
         for parse in &mut self.parses {
-            poll_language(&mut parse.language);
+            changed |= poll_language(&mut parse.language);
+        }
+        if changed {
+            self.copy_menu = None;
         }
     }
 

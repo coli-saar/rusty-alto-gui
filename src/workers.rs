@@ -1,16 +1,17 @@
 use crate::model::{
-    ChartDocument, DerivationPresentation, GrammarDocument, HeuristicChoice, RuleRow, StrategyChoice,
-    TreeEdge, TreeLayout, TreeNode, ViewContent,
+    ChartDocument, DerivationPresentation, FeatureStructureBox, FeatureStructureLayout,
+    FeatureStructureLine, FeatureStructureText, GrammarDocument, HeuristicChoice, RuleRow,
+    StrategyChoice, TreeEdge, TreeLayout, TreeNode, ValuePresentation, ViewContent,
 };
 use packed_term_arena::tree::{Tree, TreeArena};
 use rusty_alto::{
-    AstarHeuristic, AstarOptions, Explicit, Irtg, LanguageCardinality, LogProbabilityScorer,
-    MaterializationStrategy, ObligatoryLeafTables, RenderedValue, Symbol, TreeValue,
-    UniversalSxHeuristic, parse_irtg,
+    AstarHeuristic, AstarOptions, Explicit, FeatureStructure, FeatureStructureNode,
+    FeatureStructureNodeId, InputCodecRegistry, Irtg, LanguageCardinality, LogProbabilityScorer,
+    MaterializationStrategy, ObligatoryLeafTables, Symbol, TreeValue, UniversalSxHeuristic,
+    VisualRepresentation,
 };
 use std::{
-    collections::HashMap,
-    fs::File,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         Arc,
@@ -47,8 +48,11 @@ impl Drop for LanguageWorker {
 }
 
 pub fn load_grammar(path: PathBuf) -> Result<GrammarDocument, String> {
-    let file = File::open(&path).map_err(|error| error.to_string())?;
-    let grammar = Arc::new(parse_irtg(file).map_err(|error| error.to_string())?);
+    let registry = InputCodecRegistry::standard();
+    let codec = registry
+        .codec_for_path::<Irtg>(&path)
+        .map_err(|error| error.to_string())?;
+    let grammar = Arc::new(codec.read_path(&path).map_err(|error| error.to_string())?);
     let summary = grammar.grammar().application_summary();
     let interpretations = grammar.interpretation_info();
     let interpretation_names = interpretations.iter().map(|info| info.name.clone()).collect();
@@ -238,55 +242,60 @@ fn prepare_and_run_language(
             };
             let (arena, root) = iterator.clone_tree(weighted.tree());
             let derivation = grammar.resolve_derivation(&arena, root);
-            let rendered = match grammar.render_derivation(&arena, root) {
-                Ok(rendered) => rendered,
-                Err(error) => {
-                    let _ = events.send(LanguageEvent::Error(error.to_string()));
-                    return;
-                }
-            };
-            let terms = grammar
-                .interpretations()
-                .map(|interpretation| {
-                    let mut term_arena = TreeArena::<Symbol>::new();
-                    interpretation
-                        .homomorphism()
-                        .apply(&arena, root, &mut term_arena)
-                        .map(|term_root| {
-                            let signature = interpretation.algebra_signature();
-                            let layout = layout_tree_nodes(term_root, &|node| {
-                                signature.resolve(*term_arena.get_label(node)).to_owned()
-                            }, &|node| {
-                                term_arena.get_children(node).to_vec()
-                            });
-                            (
-                                interpretation.name().to_owned(),
-                                Arc::new(layout),
-                            )
-                        })
-                })
-                .collect::<Result<HashMap<_, _>, _>>();
-            let terms = match terms {
-                Ok(terms) => terms,
-                Err(error) => {
-                    let _ = events.send(LanguageEvent::Error(error.to_string()));
-                    return;
-                }
-            };
             let mut views = vec![view_from_tree("Derivation tree", &derivation)];
-            views.extend(rendered.into_iter().map(|item| match item.value {
-                RenderedValue::Text(text) => ViewContent {
-                    term: terms.get(&item.name).cloned(),
-                    name: item.name,
-                    value: text,
-                    tree: None,
-                },
-                RenderedValue::Tree(tree) => {
-                    let mut view = view_from_tree(item.name.clone(), &tree);
-                    view.term = terms.get(&item.name).cloned();
-                    view
-                }
-            }));
+            for interpretation in grammar.interpretations() {
+                let name = interpretation.name().to_owned();
+                let mut term_arena = TreeArena::<Symbol>::new();
+                let term = interpretation
+                    .homomorphism()
+                    .apply(&arena, root, &mut term_arena)
+                    .map(|term_root| {
+                        let signature = interpretation.algebra_signature();
+                        Arc::new(layout_tree_nodes(
+                            term_root,
+                            &|node| signature.resolve(*term_arena.get_label(node)).to_owned(),
+                            &|node| term_arena.get_children(node).to_vec(),
+                        ))
+                    });
+                let view = match term {
+                    Err(error) => interpretation_error_view(
+                        name,
+                        None,
+                        format!("Could not construct the interpretation term: {error}"),
+                    ),
+                    Ok(term) => match interpretation.evaluate_derivation(&arena, root) {
+                        Err(error) => interpretation_error_view(
+                            name,
+                            Some(term),
+                            format!("The derivation tree did not evaluate in this algebra: {error}"),
+                        ),
+                        Ok(evaluated) => {
+                            let value = match evaluated.visual() {
+                                VisualRepresentation::Text(text) => {
+                                    ValuePresentation::Text(text.clone())
+                                }
+                                VisualRepresentation::Tree(tree) => {
+                                    ValuePresentation::Tree(Arc::new(layout_tree(tree)))
+                                }
+                                VisualRepresentation::FeatureStructure(feature) => {
+                                    ValuePresentation::FeatureStructure(Arc::new(
+                                        layout_feature_structure(feature),
+                                    ))
+                                }
+                            };
+                            let codecs = evaluated.codecs();
+                            ViewContent {
+                                term: Some(term),
+                                name,
+                                value,
+                                evaluated: Some(Arc::new(evaluated)),
+                                codecs,
+                            }
+                        }
+                    },
+                };
+                views.push(view);
+            }
             cache.push(Arc::new(DerivationPresentation {
                 index: cache.len(),
                 weight: weighted.weight(),
@@ -304,12 +313,27 @@ fn prepare_and_run_language(
     }
 }
 
+fn interpretation_error_view(
+    name: String,
+    term: Option<Arc<TreeLayout>>,
+    error: String,
+) -> ViewContent {
+    ViewContent {
+        name,
+        term,
+        value: ValuePresentation::Error(error),
+        evaluated: None,
+        codecs: Vec::new(),
+    }
+}
+
 fn view_from_tree(name: impl Into<String>, tree: &TreeValue) -> ViewContent {
     ViewContent {
         name: name.into(),
-        value: tree.to_string(),
         term: None,
-        tree: Some(Arc::new(layout_tree(tree))),
+        value: ValuePresentation::Tree(Arc::new(layout_tree(tree))),
+        evaluated: None,
+        codecs: Vec::new(),
     }
 }
 
@@ -406,12 +430,269 @@ fn layout_tree(tree: &TreeValue) -> TreeLayout {
     )
 }
 
+const FS_CHAR_WIDTH: f32 = 7.6;
+const FS_LINE_HEIGHT: f32 = 24.0;
+const FS_ROW_GAP: f32 = 6.0;
+const FS_BRACKET_WIDTH: f32 = 8.0;
+const FS_PADDING: f32 = 8.0;
+const FS_COLUMN_GAP: f32 = 14.0;
+const FS_MARKER_SIZE: f32 = 20.0;
+
+fn layout_feature_structure(value: &FeatureStructure) -> FeatureStructureLayout {
+    fn count_incoming(
+        value: &FeatureStructure,
+        node: FeatureStructureNodeId,
+        incoming: &mut HashMap<FeatureStructureNodeId, usize>,
+        visited: &mut HashSet<FeatureStructureNodeId>,
+    ) {
+        if !visited.insert(node) {
+            return;
+        }
+        if let Some(attributes) = value.attributes(node) {
+            for attribute in attributes {
+                *incoming.entry(attribute.value).or_default() += 1;
+                count_incoming(value, attribute.value, incoming, visited);
+            }
+        }
+    }
+
+    fn assign_markers(
+        value: &FeatureStructure,
+        node: FeatureStructureNodeId,
+        incoming: &HashMap<FeatureStructureNodeId, usize>,
+        markers: &mut HashMap<FeatureStructureNodeId, usize>,
+        visited: &mut HashSet<FeatureStructureNodeId>,
+    ) {
+        if incoming.get(&node).copied().unwrap_or_default() > 1 && !markers.contains_key(&node) {
+            markers.insert(node, markers.len() + 1);
+        }
+        if !visited.insert(node) {
+            return;
+        }
+        if let Some(attributes) = value.attributes(node) {
+            for attribute in attributes {
+                assign_markers(value, attribute.value, incoming, markers, visited);
+            }
+        }
+    }
+
+    fn text_block(text: String) -> FeatureStructureLayout {
+        let width = (text.chars().count() as f32 * FS_CHAR_WIDTH).max(12.0);
+        FeatureStructureLayout {
+            texts: vec![FeatureStructureText {
+                text,
+                x: 0.0,
+                y: FS_LINE_HEIGHT / 2.0,
+                centered: false,
+            }],
+            width,
+            height: FS_LINE_HEIGHT,
+            ..Default::default()
+        }
+    }
+
+    fn marker_block(number: usize) -> FeatureStructureLayout {
+        FeatureStructureLayout {
+            texts: vec![FeatureStructureText {
+                text: number.to_string(),
+                x: FS_MARKER_SIZE / 2.0,
+                y: FS_MARKER_SIZE / 2.0,
+                centered: true,
+            }],
+            boxes: vec![FeatureStructureBox {
+                x: 0.0,
+                y: 0.0,
+                width: FS_MARKER_SIZE,
+                height: FS_MARKER_SIZE,
+            }],
+            width: FS_MARKER_SIZE,
+            height: FS_MARKER_SIZE,
+            ..Default::default()
+        }
+    }
+
+    fn append_at(
+        target: &mut FeatureStructureLayout,
+        mut source: FeatureStructureLayout,
+        x: f32,
+        y: f32,
+    ) {
+        for text in &mut source.texts {
+            text.x += x;
+            text.y += y;
+        }
+        for line in &mut source.lines {
+            line.from_x += x;
+            line.to_x += x;
+            line.from_y += y;
+            line.to_y += y;
+        }
+        for item in &mut source.boxes {
+            item.x += x;
+            item.y += y;
+        }
+        target.texts.extend(source.texts);
+        target.lines.extend(source.lines);
+        target.boxes.extend(source.boxes);
+    }
+
+    fn node_block(
+        value: &FeatureStructure,
+        node: FeatureStructureNodeId,
+        markers: &HashMap<FeatureStructureNodeId, usize>,
+        expanded: &mut HashSet<FeatureStructureNodeId>,
+    ) -> FeatureStructureLayout {
+        let marker = markers.get(&node).copied();
+        if marker.is_some() && !expanded.insert(node) {
+            return marker_block(marker.unwrap());
+        }
+        if marker.is_none() {
+            expanded.insert(node);
+        }
+
+        let mut body = match value.node(node) {
+            Some(FeatureStructureNode::Variable) => text_block("[]".to_owned()),
+            Some(FeatureStructureNode::Atom(atom)) => text_block(atom.to_owned()),
+            Some(FeatureStructureNode::Map) => {
+                let attributes = value
+                    .attributes(node)
+                    .map(|attributes| attributes.collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let attribute_width = attributes
+                    .iter()
+                    .map(|attribute| attribute.name.chars().count() as f32 * FS_CHAR_WIDTH)
+                    .fold(0.0, f32::max);
+                let children = attributes
+                    .iter()
+                    .map(|attribute| node_block(value, attribute.value, markers, expanded))
+                    .collect::<Vec<_>>();
+                let child_width = children
+                    .iter()
+                    .map(|child| child.width)
+                    .fold(0.0, f32::max);
+                let row_heights = children
+                    .iter()
+                    .map(|child| child.height.max(FS_LINE_HEIGHT) + FS_ROW_GAP)
+                    .collect::<Vec<_>>();
+                let content_height = if attributes.is_empty() {
+                    FS_LINE_HEIGHT
+                } else {
+                    row_heights.iter().sum::<f32>() - FS_ROW_GAP
+                };
+                let width = FS_BRACKET_WIDTH * 2.0
+                    + FS_PADDING * 2.0
+                    + attribute_width
+                    + if attributes.is_empty() {
+                        0.0
+                    } else {
+                        FS_COLUMN_GAP + child_width
+                    };
+                let height = content_height + FS_PADDING * 2.0;
+                let mut layout = FeatureStructureLayout {
+                    width,
+                    height,
+                    ..Default::default()
+                };
+                let left = FS_BRACKET_WIDTH;
+                let right = width - FS_BRACKET_WIDTH;
+                for (x, inward) in [(left, 1.0), (right, -1.0)] {
+                    layout.lines.push(FeatureStructureLine {
+                        from_x: x,
+                        from_y: 0.0,
+                        to_x: x + inward * FS_BRACKET_WIDTH,
+                        to_y: 0.0,
+                    });
+                    layout.lines.push(FeatureStructureLine {
+                        from_x: x,
+                        from_y: 0.0,
+                        to_x: x,
+                        to_y: height,
+                    });
+                    layout.lines.push(FeatureStructureLine {
+                        from_x: x,
+                        from_y: height,
+                        to_x: x + inward * FS_BRACKET_WIDTH,
+                        to_y: height,
+                    });
+                }
+                let mut y = FS_PADDING;
+                for ((attribute, child), row_height) in attributes
+                    .iter()
+                    .zip(children)
+                    .zip(row_heights.iter().copied())
+                {
+                    let child_height = child.height;
+                    let content_row_height = row_height - FS_ROW_GAP;
+                    layout.texts.push(FeatureStructureText {
+                        text: attribute.name.to_owned(),
+                        x: FS_BRACKET_WIDTH + FS_PADDING,
+                        y: y + content_row_height / 2.0,
+                        centered: false,
+                    });
+                    append_at(
+                        &mut layout,
+                        child,
+                        FS_BRACKET_WIDTH + FS_PADDING + attribute_width + FS_COLUMN_GAP,
+                        y + (content_row_height - child_height) / 2.0,
+                    );
+                    y += row_height;
+                }
+                layout
+            }
+            None => text_block("?".to_owned()),
+        };
+
+        if let Some(number) = marker {
+            let marker = marker_block(number);
+            let gap = 6.0;
+            let width = marker.width + gap + body.width;
+            let height = marker.height.max(body.height);
+            let mut combined = FeatureStructureLayout {
+                width,
+                height,
+                ..Default::default()
+            };
+            append_at(&mut combined, marker, 0.0, (height - FS_MARKER_SIZE) / 2.0);
+            let body_y = (height - body.height) / 2.0;
+            append_at(&mut combined, body, FS_MARKER_SIZE + gap, body_y);
+            body = combined;
+        }
+        body
+    }
+
+    let root = value.root();
+    let mut incoming = HashMap::from([(root, 1)]);
+    count_incoming(value, root, &mut incoming, &mut HashSet::new());
+    let mut markers = HashMap::new();
+    assign_markers(value, root, &incoming, &mut markers, &mut HashSet::new());
+    let mut layout = node_block(value, root, &markers, &mut HashSet::new());
+    let margin = 22.0;
+    for text in &mut layout.texts {
+        text.x += margin;
+        text.y += margin;
+    }
+    for line in &mut layout.lines {
+        line.from_x += margin;
+        line.to_x += margin;
+        line.from_y += margin;
+        line.to_y += margin;
+    }
+    for item in &mut layout.boxes {
+        item.x += margin;
+        item.y += margin;
+    }
+    layout.width += margin * 2.0;
+    layout.height += margin * 2.0;
+    layout
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusty_alto::parse_irtg;
     use std::time::Duration;
 
-    const SCFG: &str = r#"
+const SCFG: &str = r#"
 interpretation english: de.up.ling.irtg.algebra.StringAlgebra
 interpretation german: de.up.ling.irtg.algebra.StringAlgebra
 
@@ -456,9 +737,80 @@ P -> r12
   [german] mit
 "#;
 
+    const SHIEBER_TAG: &str = r#"
+family vinf_tv: { vinf_tv, vinf_tv_aux }
+
+tree vinf_tv:
+  S @NA {
+    np! [case=nom][]
+    S { np! [case=?o] [] }
+    v+ [objcase=?o] []
+  }
+
+tree vinf_tv_aux:
+  S @NA {
+    S { S @NA { np! [case=?o] [] S* } }
+    v+ [objcase=?o][]
+  }
+
+family np_n: { np_n }
+
+tree np_n:
+  np [] [case=?c] { n+ [case=?c] [] }
+
+tree adj_det:
+  np [] [case=?c] {
+    det+ [case=?c] []
+    np* [case=?c] []
+  }
+
+tree np_pron:
+  np[][case=?c] { pron+ [case=?c] [] }
+
+word 'mer': np_pron[case=nom]
+word 'em': adj_det[case=dat]
+word 'es': adj_det[case=acc]
+word 'd': adj_det[case=acc]
+word 'de': adj_det[case=acc]
+word 'hans': np_n
+word 'huus': np_n
+word 'chind': np_n
+word 'aastriiche': <vinf_tv>[objcase=acc]
+
+lemma 'laa': <vinf_tv>[objcase=acc] {
+  word "lönd"
+  word "laa"
+}
+
+lemma 'hälfe': <vinf_tv>[objcase=dat] {
+  word 'hälfed'
+  word 'hälfe'
+}
+"#;
+
     #[test]
     fn loads_parses_and_pages_derivations() {
-        let grammar_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/tiny.irtg");
+        let directory =
+            std::env::temp_dir().join(format!("rusty_alto_gui_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let grammar_path = directory.join("tiny.irtg");
+        std::fs::write(
+            &grammar_path,
+            r#"
+interpretation string: de.up.ling.irtg.algebra.StringAlgebra
+interpretation tree: de.up.ling.irtg.algebra.TreeWithAritiesAlgebra
+S! -> r(NP, VP)
+  [string] *(?1, ?2)
+  [tree] S_2(?1, ?2)
+NP -> john
+  [string] john
+  [tree] john_0
+VP -> sleeps
+  [string] sleeps
+  [tree] sleeps_0
+"#,
+        )
+        .unwrap();
         let document = load_grammar(grammar_path).expect("load example grammar");
         assert_eq!(document.summary.rule_count, 3);
 
@@ -494,10 +846,65 @@ P -> r12
         };
         assert_eq!(item.index, 0);
         assert_eq!(item.views.len(), 3);
-        assert!(item.views[0].tree.is_some());
+        assert!(matches!(item.views[0].value, ValuePresentation::Tree(_)));
         for view in item.views.iter().skip(1) {
             assert!(view.term.is_some());
+            assert!(view.evaluated.is_some());
+            assert_eq!(view.codecs.len(), 1);
         }
+        let string = item
+            .views
+            .iter()
+            .find(|view| view.name == "string")
+            .unwrap();
+        assert!(matches!(
+            &string.value,
+            ValuePresentation::Text(text) if text == "john sleeps"
+        ));
+        assert_eq!(
+            string.evaluated.as_ref().unwrap().encode("string").unwrap(),
+            "john sleeps"
+        );
+    }
+
+    #[test]
+    fn grammar_loading_uses_registered_extensions_and_read_path() {
+        let directory =
+            std::env::temp_dir().join(format!("rusty_alto_gui_codecs_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let trees = directory.join("trees.tag");
+        let grammar = directory.join("grammar.tag");
+        std::fs::write(&trees, "tree v: S @NA { V+ }").unwrap();
+        std::fs::write(&grammar, "#include 'trees.tag'\nword sleeps: v").unwrap();
+        let loaded = load_grammar(grammar).expect("load Tulipac grammar with relative include");
+        assert!(loaded.grammar.interpretation_ref("string").is_some());
+
+        let unknown = directory.join("grammar.unknown");
+        std::fs::write(&unknown, "").unwrap();
+        assert!(load_grammar(unknown).unwrap_err().contains("no input codec"));
+        let extensionless = directory.join("grammar");
+        std::fs::write(&extensionless, "").unwrap();
+        assert!(load_grammar(extensionless).unwrap_err().contains("extension"));
+    }
+
+    #[test]
+    fn feature_structure_layout_marks_shared_nodes() {
+        let value =
+            FeatureStructure::parse("[left: #x [case: nom], right: #x, open: #y]").unwrap();
+        let layout = layout_feature_structure(&value);
+        assert!(layout.width > 100.0);
+        assert!(layout.height > 40.0);
+        assert!(layout.texts.iter().any(|text| text.text == "left"));
+        assert!(layout.texts.iter().any(|text| text.text == "right"));
+        assert!(
+            layout
+                .texts
+                .iter()
+                .filter(|text| text.text == "1")
+                .count()
+                >= 2
+        );
+        assert!(!layout.boxes.is_empty());
     }
 
     #[test]
@@ -542,5 +949,55 @@ P -> r12
                 .expect("grammar language ready"),
             LanguageEvent::Ready(LanguageCardinality::Infinite)
         ));
+    }
+
+    #[test]
+    fn failed_feature_interpretation_does_not_stop_tag_language_enumeration() {
+        let directory =
+            std::env::temp_dir().join(format!("rusty_alto_gui_shieber_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("shieber.tag");
+        std::fs::write(&path, SHIEBER_TAG).unwrap();
+        let grammar = load_grammar(path).unwrap().grammar;
+        let (tx, rx) = mpsc::channel();
+        let worker = start_grammar_language_worker(grammar, tx);
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            LanguageEvent::Ready(LanguageCardinality::Infinite)
+        ));
+
+        let mut saw_feature_error = false;
+        let mut saw_later_derivation = false;
+        for index in 0..12 {
+            worker.request(index);
+            let item = match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                LanguageEvent::Derivation(item) => item,
+                other => panic!("expected derivation {index}, got {other:?}"),
+            };
+            assert_eq!(item.index, index);
+            let feature_failed = matches!(
+                &item.views.iter().find(|view| view.name == "ft").unwrap().value,
+                ValuePresentation::Error(error) if error.contains("did not evaluate")
+            );
+            if feature_failed {
+                saw_feature_error = true;
+                assert!(matches!(
+                    item.views
+                        .iter()
+                        .find(|view| view.name == "string")
+                        .unwrap()
+                        .value,
+                    ValuePresentation::Text(_)
+                ));
+            } else if saw_feature_error {
+                saw_later_derivation = true;
+                break;
+            }
+        }
+        assert!(saw_feature_error, "fixture should contain an invalid ft value");
+        assert!(
+            saw_later_derivation,
+            "enumeration should continue after an invalid interpretation"
+        );
     }
 }
