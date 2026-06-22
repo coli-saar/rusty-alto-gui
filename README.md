@@ -29,6 +29,9 @@ the [`rusty-alto`](https://crates.io/crates/rusty-alto) parsing library.
   feature structures.
 - Switch between interpretations, zoom visual values, and copy values using
   the output codecs provided by `rusty-alto`.
+- Drag any tree, derivation term, or feature structure straight out of the
+  window to export it as a PDF (drop it into Finder, Explorer, or another
+  application). Available on macOS and Windows.
 - Work with multiple grammars at once, each in its own native window.
 
 | Parse chart | Interpretation and derivation views |

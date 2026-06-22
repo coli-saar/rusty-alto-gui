@@ -90,6 +90,9 @@ enum AppMsg {
         result: Result<GrammarDocument, String>,
     },
     Poll,
+    /// A PDF drag-out finished; reports failures back to the originating window.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    PdfDragFinished(window::Id, Result<(), String>),
     #[cfg(target_os = "macos")]
     WindowFocused(window::Id),
     #[cfg(target_os = "macos")]
@@ -138,10 +141,32 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
                 move |path| AppMsg::GrammarPicked(id, path),
             )
         }
+        // Exporting a view to PDF is an app-level action: it needs the window's
+        // native handle to start a drag-out. macOS/Windows only (see
+        // `start_pdf_drag`); elsewhere the trigger isn't wired and this never
+        // fires, falling through to the generic window arm below.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        AppMsg::Window(
+            id,
+            Message::StartPdfDrag {
+                svg,
+                name,
+                display_size,
+            },
+        ) => start_pdf_drag(app, id, svg, name, display_size),
         AppMsg::Window(id, message) => match app.windows.get_mut(&id) {
             Some(window) => update(window, message).map(move |m| AppMsg::Window(id, m)),
             None => Task::none(),
         },
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        AppMsg::PdfDragFinished(_, Ok(())) => Task::none(),
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        AppMsg::PdfDragFinished(id, Err(error)) => {
+            if let Some(window) = app.windows.get_mut(&id) {
+                window.fail(format!("Could not export PDF: {error}"));
+            }
+            Task::none()
+        }
         AppMsg::GrammarPicked(_, None) => Task::none(),
         AppMsg::GrammarPicked(asking_id, Some(path)) => {
             // Load into the asking window if it's still empty, otherwise open a
@@ -298,6 +323,48 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
     }
 }
 
+/// Render the SVG `svg` to a temporary PDF and drag it out of window `id`.
+///
+/// This starts a native drag-out using the window's handle (obtained via
+/// [`iced::window::run`]), so the user can drop the PDF straight into
+/// Finder/Explorer or another application. It only exists on macOS and Windows:
+/// winit-based platforms (Linux) have no drag-source equivalent, and the views
+/// don't wire up the trigger there, so this is never reached.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn start_pdf_drag(
+    app: &mut App,
+    id: window::Id,
+    svg: Arc<String>,
+    name: String,
+    display_size: iced::Size,
+) -> Task<AppMsg> {
+    let path = match crate::pdf_export::write_temp_pdf(&svg, &name) {
+        Ok(path) => path,
+        Err(error) => {
+            if let Some(window) = app.windows.get_mut(&id) {
+                window.fail(format!("Could not export PDF: {error}"));
+            }
+            return Task::none();
+        }
+    };
+
+    // Draw the drag preview at the view's on-screen size so it sits over the
+    // pointer at the same scale the user is looking at.
+    let longest_side = display_size.width.max(display_size.height);
+    let thumbnail = crate::pdf_export::drag_thumbnail(&svg, longest_side);
+    iced::window::run(id, move |window| {
+        let result = drag::start_drag(
+            &window,
+            drag::DragItem::Files(vec![path.clone()]),
+            drag::Image::Raw(thumbnail.clone()),
+            |_, _| {},
+            drag::Options::default(),
+        )
+        .map_err(|error| error.to_string());
+        AppMsg::PdfDragFinished(id, result)
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn sync_view_menu(app: &App) {
     let state = app
@@ -397,6 +464,14 @@ pub enum Message {
     CopyWithCodec(String),
     ShowShortcuts,
     HideShortcuts,
+    /// Drag a rendered view out of the window as a PDF file. Carries the SVG
+    /// source of the visual, a base file name (without extension), and the
+    /// view's on-screen size so the drag preview can be drawn to match.
+    StartPdfDrag {
+        svg: Arc<String>,
+        name: String,
+        display_size: iced::Size,
+    },
 }
 
 fn update(state: &mut Workbench, message: Message) -> Task<Message> {
@@ -738,6 +813,8 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
             state.show_shortcuts = true;
         }
         Message::HideShortcuts => state.show_shortcuts = false,
+        // Handled at the app level (see `start_pdf_drag`); never reaches here.
+        Message::StartPdfDrag { .. } => {}
     }
     Task::none()
 }
@@ -1493,9 +1570,23 @@ fn language_page<'a>(
                 ValuePresentation::Text(value) => {
                     container(text(value).size(15)).width(Length::Fill).into()
                 }
-                ValuePresentation::Tree(layout) => tree_view(layout.clone(), language.zoom),
+                ValuePresentation::Tree(layout) => {
+                    tree_view(layout.clone(), language.zoom, |svg, display_size| {
+                        Message::StartPdfDrag {
+                            svg,
+                            name: "tree".into(),
+                            display_size,
+                        }
+                    })
+                }
                 ValuePresentation::FeatureStructure(layout) => {
-                    feature_structure_view(layout.clone(), language.zoom)
+                    feature_structure_view(layout.clone(), language.zoom, |svg, display_size| {
+                        Message::StartPdfDrag {
+                            svg,
+                            name: "feature-structure".into(),
+                            display_size,
+                        }
+                    })
                 }
             };
             let value = if let Some(evaluated) = &output.evaluated {
@@ -1534,7 +1625,17 @@ fn language_page<'a>(
                     column![
                         panel_section("Value", value, value_height),
                         rule::horizontal(1).style(theme::separator),
-                        panel_section("Term", tree_view(term.clone(), language.zoom), term_height),
+                        panel_section(
+                            "Term",
+                            tree_view(term.clone(), language.zoom, |svg, display_size| {
+                                Message::StartPdfDrag {
+                                    svg,
+                                    name: "term".into(),
+                                    display_size,
+                                }
+                            }),
+                            term_height,
+                        ),
                     ]
                     .height(Length::Fill),
                 )

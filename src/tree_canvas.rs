@@ -8,19 +8,31 @@ use iced::{
 };
 use std::{fmt::Write, sync::Arc};
 
-pub fn tree_view<Message: 'static>(
+/// Render a derivation tree as a scrollable SVG.
+///
+/// `on_export` builds the message emitted when the user presses the tree to
+/// drag it out as a PDF; it receives the tree's SVG source and its on-screen
+/// size. Drag-out only exists on macOS and Windows (see
+/// `app::start_pdf_drag`), so on other platforms the press is not wired up.
+pub fn tree_view<Message: 'static + Clone>(
     layout: Arc<TreeLayout>,
     zoom: f32,
+    on_export: impl FnOnce(Arc<String>, Size) -> Message,
 ) -> Element<'static, Message> {
     let scale = zoom.max(0.35);
     let natural_width = layout.width + 24.0;
     let natural_height = layout.height + 36.0;
     let width = natural_width * scale;
     let height = natural_height * scale;
+    let svg = Arc::new(tree_svg(&layout, natural_width, natural_height));
     let image = svg_view::natural_svg(
-        svg::Handle::from_memory(tree_svg(&layout, natural_width, natural_height)),
+        svg::Handle::from_memory(svg.as_bytes().to_vec()),
         Size::new(width, height),
     );
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let image = iced::widget::mouse_area(image).on_press(on_export(svg, Size::new(width, height)));
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = (on_export, svg);
 
     scrollable(image)
         .direction(scrollable::Direction::Both {
@@ -32,7 +44,7 @@ pub fn tree_view<Message: 'static>(
         .into()
 }
 
-fn tree_svg(layout: &TreeLayout, width: f32, height: f32) -> Vec<u8> {
+fn tree_svg(layout: &TreeLayout, width: f32, height: f32) -> String {
     const OFFSET_X: f32 = 12.0;
     const OFFSET_Y: f32 = 18.0;
     let mut svg = String::new();
@@ -162,7 +174,7 @@ fn tree_svg(layout: &TreeLayout, width: f32, height: f32) -> Vec<u8> {
         }
     }
     svg.push_str("</svg>");
-    svg.into_bytes()
+    svg
 }
 
 fn escape_xml(text: &str) -> String {
@@ -223,7 +235,7 @@ mod tests {
             width: 60.0,
             height: 124.0,
         };
-        let output = String::from_utf8(tree_svg(&layout, 84.0, 160.0)).unwrap();
+        let output = tree_svg(&layout, 84.0, 160.0);
         assert_eq!(output.matches("<text ").count(), 2);
         assert_eq!(output.matches("<line ").count(), 1);
         assert_eq!(output.matches("<rect ").count(), 2);
@@ -252,7 +264,7 @@ mod tests {
             width: 200.0,
             height: 110.0,
         };
-        let output = String::from_utf8(tree_svg(&layout, 224.0, 146.0)).unwrap();
+        let output = tree_svg(&layout, 224.0, 146.0);
         assert!(output.contains("#e7f6fa"));
         assert!(output.contains("#fff1df"));
         assert!(!output.contains("<path") || !output.contains("<path stroke="));

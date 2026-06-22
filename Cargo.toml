@@ -23,6 +23,23 @@ rfd = "0.17.2"
 rusty-alto = "0.2.0"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
+# Export the SVG views (trees, feature structures) to PDF. usvg/resvg/tiny-skia
+# are already pulled in transitively by iced's "svg"/"tiny-skia" features, so
+# pinning them as direct deps reuses the same versions: the usvg::Tree we parse
+# is shared by svg2pdf (PDF) and resvg (the drag thumbnail), no type mismatch.
+svg2pdf = "0.13"
+usvg = "0.45"
+resvg = "0.45"
+tiny-skia = "0.11"
+
+# Native drag-out of a generated PDF (drag a tree straight into Finder/Explorer).
+# The `drag` crate accepts a raw-window-handle on macOS and Windows, which iced
+# exposes via `window::run`. On Linux it requires a GTK ApplicationWindow, which
+# a winit-based app like iced cannot provide, so the PDF drag-out feature simply
+# does not exist on Linux (the trigger is not wired there).
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+drag = "2.1.1"
+
 # Native menu bar. A top-of-screen menu bar is a macOS concept (and iced 0.13
 # doesn't expose the per-window handles Windows/Linux menus need), so this is
 # macOS-only for now. muda is a cross-platform menu crate, so extending to other

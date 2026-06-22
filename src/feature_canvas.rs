@@ -5,23 +5,31 @@ use iced::{
 };
 use std::{fmt::Write, sync::Arc};
 
-pub fn feature_structure_view<Message: 'static>(
+/// Render a feature structure as a scrollable SVG.
+///
+/// `on_export` builds the message emitted when the user presses the diagram to
+/// drag it out as a PDF; it receives the diagram's SVG source and its on-screen
+/// size. Drag-out only exists on macOS and Windows (see `app::start_pdf_drag`),
+/// so on other platforms the press is not wired up.
+pub fn feature_structure_view<Message: 'static + Clone>(
     layout: Arc<FeatureStructureLayout>,
     zoom: f32,
+    on_export: impl FnOnce(Arc<String>, Size) -> Message,
 ) -> Element<'static, Message> {
     let scale = zoom.max(0.35);
     let natural_width = layout.width + 24.0;
     let natural_height = layout.height + 36.0;
     let width = natural_width * scale;
     let height = natural_height * scale;
+    let svg = Arc::new(feature_structure_svg(&layout, natural_width, natural_height));
     let image = svg_view::natural_svg(
-        svg::Handle::from_memory(feature_structure_svg(
-            &layout,
-            natural_width,
-            natural_height,
-        )),
+        svg::Handle::from_memory(svg.as_bytes().to_vec()),
         Size::new(width, height),
     );
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let image = iced::widget::mouse_area(image).on_press(on_export(svg, Size::new(width, height)));
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = (on_export, svg);
 
     scrollable(image)
         .direction(scrollable::Direction::Both {
@@ -33,7 +41,7 @@ pub fn feature_structure_view<Message: 'static>(
         .into()
 }
 
-fn feature_structure_svg(layout: &FeatureStructureLayout, width: f32, height: f32) -> Vec<u8> {
+fn feature_structure_svg(layout: &FeatureStructureLayout, width: f32, height: f32) -> String {
     const OFFSET_X: f32 = 12.0;
     const OFFSET_Y: f32 = 18.0;
     let mut svg = String::new();
@@ -83,7 +91,7 @@ fn feature_structure_svg(layout: &FeatureStructureLayout, width: f32, height: f3
         .unwrap();
     }
     svg.push_str("</g></svg>");
-    svg.into_bytes()
+    svg
 }
 
 fn escape_xml(text: &str) -> String {
@@ -123,7 +131,7 @@ mod tests {
             width: 30.0,
             height: 24.0,
         };
-        let output = String::from_utf8(feature_structure_svg(&layout, 54.0, 60.0)).unwrap();
+        let output = feature_structure_svg(&layout, 54.0, 60.0);
         assert_eq!(output.matches("<text ").count(), 1);
         assert_eq!(output.matches("<line ").count(), 1);
         assert_eq!(output.matches("<rect ").count(), 1);
