@@ -1,10 +1,13 @@
 use crate::model::{
-    ChartDocument, DerivationPresentation, FeatureStructureBox, FeatureStructureLayout,
-    FeatureStructureLine, FeatureStructureText, GrammarDocument, HeuristicChoice, PresentationMode,
-    RuleRow, StrategyChoice, TagPresentation, TreeEdge, TreeLayout, TreeNode, ValuePresentation,
-    ViewContent,
+    ChartDocument, DerivationPresentation, FailurePresentation, FeatureStructureBox,
+    FeatureStructureLayout, FeatureStructureLine, FeatureStructureText, GrammarDocument,
+    HeuristicChoice, ParseOutcome, PresentationMode, RuleRow, StrategyChoice, TagPresentation,
+    TreeEdge, TreeLayout, TreeNode, ValuePresentation, ViewContent,
 };
-use crate::tag_folder::{AnnotatedTree, fold_tag_derivation};
+use crate::tag_folder::{
+    AnnotatedTree, FeatureFailure, FeatureFailureKind, FeatureOrigin, diagnose_tag_derivation,
+    fold_tag_derivation,
+};
 use packed_term_arena::tree::{Tree, TreeArena};
 use rusty_alto::{
     AstarHeuristic, AstarOptions, Explicit, FeatureStructure, FeatureStructureNode,
@@ -35,6 +38,14 @@ pub enum LanguageEvent {
 pub struct LanguageWorker {
     sender: Sender<usize>,
     cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ParseOptions {
+    pub strategy: StrategyChoice,
+    pub heuristic: HeuristicChoice,
+    pub stop_at_first_goal: bool,
+    pub diagnose_feature_rejections: bool,
 }
 
 impl LanguageWorker {
@@ -96,22 +107,30 @@ pub fn parse(
         grammar,
         inputs,
         required_valid,
-        strategy,
-        heuristic,
-        stop_at_first_goal,
+        ParseOptions {
+            strategy,
+            heuristic,
+            stop_at_first_goal,
+            diagnose_feature_rejections: false,
+        },
         ParseControl::new(),
     )
+    .map(|outcome| outcome.chart)
 }
 
 pub fn parse_controlled(
     grammar: Arc<Irtg>,
     inputs: Vec<(String, String)>,
     required_valid: Vec<String>,
-    strategy: StrategyChoice,
-    heuristic: HeuristicChoice,
-    stop_at_first_goal: bool,
+    options: ParseOptions,
     control: ParseControl,
-) -> Result<ChartDocument, String> {
+) -> Result<ParseOutcome, String> {
+    let ParseOptions {
+        strategy,
+        heuristic,
+        stop_at_first_goal,
+        diagnose_feature_rejections,
+    } = options;
     let start = Instant::now();
     let mut parsed = Vec::with_capacity(inputs.len());
     // Remember the first string-algebra input (its homomorphism + length drive
@@ -189,6 +208,17 @@ pub fn parse_controlled(
     let mut automaton = result.automaton;
     let mut state_names = result.state_names;
     let mut state_parts = result.state_parts;
+    let feature_filter_requested = required_valid.iter().any(|name| name == "ft");
+    let unfiltered_nonempty = automaton.language_cardinality() != LanguageCardinality::Finite(0);
+    let unfiltered = (diagnose_feature_rejections && feature_filter_requested).then(|| {
+        chart_document(
+            &grammar,
+            Arc::new(automaton.clone()),
+            &state_names,
+            &state_parts,
+            start.elapsed(),
+        )
+    });
     for name in required_valid {
         let filtered = grammar
             .filter_non_null_with_state_origins_controlled(&automaton, &name, &control)
@@ -219,6 +249,36 @@ pub fn parse_controlled(
         automaton = filtered.automaton;
     }
     let automaton = Arc::new(automaton);
+    let filtered_empty = automaton.language_cardinality() == LanguageCardinality::Finite(0);
+    if diagnose_feature_rejections
+        && feature_filter_requested
+        && unfiltered_nonempty
+        && filtered_empty
+    {
+        return Ok(ParseOutcome {
+            chart: unfiltered.expect("feature-filter snapshot"),
+            rejected_by_features: true,
+        });
+    }
+    Ok(ParseOutcome {
+        chart: chart_document(
+            &grammar,
+            automaton,
+            &state_names,
+            &state_parts,
+            start.elapsed(),
+        ),
+        rejected_by_features: false,
+    })
+}
+
+fn chart_document(
+    grammar: &Irtg,
+    automaton: Arc<Explicit>,
+    state_names: &[String],
+    state_parts: &[Vec<String>],
+    elapsed: std::time::Duration,
+) -> ChartDocument {
     let summary = automaton.application_summary();
     let resolved = automaton.resolve_rules(
         |state| {
@@ -246,12 +306,12 @@ pub fn parse_controlled(
             )
         })
         .collect();
-    Ok(ChartDocument {
+    ChartDocument {
         automaton,
         summary,
-        elapsed: start.elapsed(),
+        elapsed,
         rules,
-    })
+    }
 }
 
 pub fn start_chart_language_worker(
@@ -388,6 +448,7 @@ fn prepare_and_run_language(
                 };
                 views.push(view);
             }
+            let diagnosis = diagnose_tag_derivation(grammar, &arena, root).ok();
             let (folded_derived, fold_warning) = match fold_tag_derivation(grammar, &arena, root) {
                 Ok(tree) => (
                     Some(ViewContent {
@@ -397,7 +458,16 @@ fn prepare_and_run_language(
                     }),
                     None,
                 ),
-                Err(error) => (None, Some(error.to_string())),
+                Err(error) => (
+                    diagnosis.as_ref().map(|diagnostic| ViewContent {
+                        name: "Derived tree".into(),
+                        value: ValuePresentation::Tree(Arc::new(layout_annotated_tree(
+                            &diagnostic.tree,
+                        ))),
+                        ..Default::default()
+                    }),
+                    Some(error.to_string()),
+                ),
             };
             let derived_tree = folded_derived.or_else(|| {
                 views
@@ -415,8 +485,21 @@ fn prepare_and_run_language(
             });
             let tag = derived_tree.map(|derived_tree| TagPresentation {
                 derived_tree,
-                derivation: view_from_tree_filtered("Derivation", &derivation, false),
-                derivation_with_technical: view_from_tree_filtered("Derivation", &derivation, true),
+                derivation: view_from_tree_filtered(
+                    "Derivation",
+                    &derivation,
+                    false,
+                    diagnosis.as_ref().map(|item| &item.failure),
+                ),
+                derivation_with_technical: view_from_tree_filtered(
+                    "Derivation",
+                    &derivation,
+                    true,
+                    diagnosis.as_ref().map(|item| &item.failure),
+                ),
+                failure: diagnosis
+                    .as_ref()
+                    .map(|diagnostic| failure_presentation(&diagnostic.failure)),
             });
             cache.push(Arc::new(DerivationPresentation {
                 index: cache.len(),
@@ -465,15 +548,114 @@ fn view_from_tree_filtered(
     name: impl Into<String>,
     tree: &TreeValue,
     show_technical: bool,
+    failure: Option<&FeatureFailure>,
 ) -> ViewContent {
+    let conflict_paths = failure.map(conflict_derivation_paths).unwrap_or_default();
     ViewContent {
         name: name.into(),
         warning: None,
         term: None,
-        value: ValuePresentation::Tree(Arc::new(layout_derivation_tree(tree, show_technical))),
+        value: ValuePresentation::Tree(Arc::new(layout_derivation_tree(
+            tree,
+            show_technical,
+            &conflict_paths,
+        ))),
         evaluated: None,
         codecs: Vec::new(),
     }
+}
+
+fn conflict_derivation_paths(failure: &FeatureFailure) -> std::collections::BTreeSet<Vec<usize>> {
+    let origins: Vec<&FeatureOrigin> = match failure.kind.as_ref() {
+        FeatureFailureKind::Unification {
+            left_origins,
+            right_origins,
+            ..
+        } => left_origins.iter().chain(right_origins).collect(),
+        FeatureFailureKind::Projection { origin, .. }
+        | FeatureFailureKind::Remapping { origin, .. }
+        | FeatureFailureKind::InvalidOperation { origin, .. } => vec![origin],
+    };
+    origins
+        .into_iter()
+        .map(|origin| origin.derivation_path.clone())
+        .collect()
+}
+
+fn failure_presentation(failure: &FeatureFailure) -> FailurePresentation {
+    fn origin_label(origins: &[FeatureOrigin], fallback: &FeatureOrigin) -> String {
+        origins
+            .first()
+            .map(origin_description)
+            .unwrap_or_else(|| origin_description(fallback))
+    }
+    match failure.kind.as_ref() {
+        FeatureFailureKind::Unification {
+            path,
+            left,
+            right,
+            left_origins,
+            right_origins,
+        } => FailurePresentation {
+            title: format!(
+                "Unification failed at {}",
+                if path.is_empty() {
+                    "<root>".into()
+                } else {
+                    path.join(".")
+                }
+            ),
+            path: if path.is_empty() {
+                "<root>".into()
+            } else {
+                path.join(".")
+            },
+            left: left.to_string(),
+            right: right.to_string(),
+            left_origin: origin_label(left_origins, &failure.at),
+            right_origin: origin_label(right_origins, &failure.at),
+            operation: failure.operation.clone(),
+        },
+        FeatureFailureKind::Projection { attribute, origin } => FailurePresentation {
+            title: format!("Projection failed for {attribute}"),
+            path: attribute.clone(),
+            left: "Attribute is unavailable".into(),
+            right: String::new(),
+            left_origin: origin_description(origin),
+            right_origin: String::new(),
+            operation: failure.operation.clone(),
+        },
+        FeatureFailureKind::Remapping {
+            specification,
+            origin,
+        } => FailurePresentation {
+            title: "Feature remapping failed".into(),
+            path: specification.clone(),
+            left: "A source attribute is unavailable or targets collide".into(),
+            right: String::new(),
+            left_origin: origin_description(origin),
+            right_origin: String::new(),
+            operation: failure.operation.clone(),
+        },
+        FeatureFailureKind::InvalidOperation { operation, origin } => FailurePresentation {
+            title: "Feature evaluation failed".into(),
+            path: operation.clone(),
+            left: "Unsupported or invalid feature operation".into(),
+            right: String::new(),
+            left_origin: origin_description(origin),
+            right_origin: String::new(),
+            operation: failure.operation.clone(),
+        },
+    }
+}
+
+fn origin_description(origin: &FeatureOrigin) -> String {
+    let node = if origin.local_key.is_empty() {
+        "rule".into()
+    } else {
+        origin.local_key.clone()
+    };
+    format!("{} · {node}", origin.grammar_symbol)
 }
 
 const TREE_H_GAP: f32 = 28.0;
@@ -487,6 +669,7 @@ struct DisplayTree {
     top: Option<String>,
     bottom: Option<String>,
     muted: bool,
+    conflict: bool,
     children: Vec<DisplayTree>,
 }
 
@@ -502,6 +685,7 @@ fn layout_annotated_tree(tree: &AnnotatedTree) -> TreeLayout {
             top: tree.top.as_ref().map(format_feature_structure_compact),
             bottom: tree.bottom.as_ref().map(format_feature_structure_compact),
             muted: false,
+            conflict: tree.conflict,
             children: tree.children.iter().map(convert).collect(),
         }
     }
@@ -578,15 +762,31 @@ fn format_feature_structure_compact(value: &FeatureStructure) -> String {
     render(value, value.root(), &markers, &mut HashSet::new())
 }
 
-fn layout_derivation_tree(tree: &TreeValue, show_technical: bool) -> TreeLayout {
-    fn convert(tree: &TreeValue, node: Tree, show_technical: bool) -> Vec<DisplayTree> {
+fn layout_derivation_tree(
+    tree: &TreeValue,
+    show_technical: bool,
+    conflict_paths: &std::collections::BTreeSet<Vec<usize>>,
+) -> TreeLayout {
+    fn convert(
+        tree: &TreeValue,
+        node: Tree,
+        show_technical: bool,
+        conflict_paths: &std::collections::BTreeSet<Vec<usize>>,
+        path: &mut Vec<usize>,
+    ) -> Vec<DisplayTree> {
         let arena = tree.arena();
         let label = arena.get_label(node);
         let technical = label.starts_with("*NOP*");
         let children = arena
             .get_children(node)
             .iter()
-            .flat_map(|&child| convert(tree, child, show_technical))
+            .enumerate()
+            .flat_map(|(index, &child)| {
+                path.push(index);
+                let converted = convert(tree, child, show_technical, conflict_paths, path);
+                path.pop();
+                converted
+            })
             .collect::<Vec<_>>();
         if technical && !show_technical {
             children
@@ -596,12 +796,19 @@ fn layout_derivation_tree(tree: &TreeValue, show_technical: bool) -> TreeLayout 
                 top: None,
                 bottom: None,
                 muted: technical,
+                conflict: conflict_paths.contains(path),
                 children,
             }]
         }
     }
 
-    let mut roots = convert(tree, tree.root(), show_technical);
+    let mut roots = convert(
+        tree,
+        tree.root(),
+        show_technical,
+        conflict_paths,
+        &mut Vec::new(),
+    );
     if roots.len() == 1 {
         layout_display_tree(&roots.remove(0))
     } else {
@@ -610,6 +817,7 @@ fn layout_derivation_tree(tree: &TreeValue, show_technical: bool) -> TreeLayout 
             top: None,
             bottom: None,
             muted: false,
+            conflict: false,
             children: roots,
         })
     }
@@ -651,6 +859,7 @@ fn layout_display_tree(tree: &DisplayTree) -> TreeLayout {
                     top: tree.top.clone(),
                     bottom: tree.bottom.clone(),
                     muted: tree.muted,
+                    conflict: tree.conflict,
                     x: node_width / 2.0,
                     y: 0.0,
                     width: node_width,
@@ -722,6 +931,7 @@ fn layout_display_tree(tree: &DisplayTree) -> TreeLayout {
             top: tree.top.clone(),
             bottom: tree.bottom.clone(),
             muted: tree.muted,
+            conflict: tree.conflict,
             x: root_x,
             y: 0.0,
             width: node_width,
@@ -792,6 +1002,7 @@ where
                     top: None,
                     bottom: None,
                     muted: false,
+                    conflict: false,
                     x: node_width / 2.0,
                     y: 0.0,
                     width: node_width,
@@ -864,6 +1075,7 @@ where
             top: None,
             bottom: None,
             muted: false,
+            conflict: false,
             x: root_x,
             y: 0.0,
             width: node_width,
@@ -1721,6 +1933,126 @@ word 'john': noun
                     .is_ok()
             );
         }
+    }
+
+    #[test]
+    fn tag_feature_rejection_preserves_sentence_chart_and_diagnostics() {
+        let directory =
+            std::env::temp_dir().join(format!("rusty_alto_gui_rejected_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("rejected.tag");
+        std::fs::write(
+            &path,
+            r#"
+tree sentence:
+  S @NA [][] { NP! [case=nom][] V+ @NA [][] }
+
+tree noun:
+  NP @NA [case=acc][] { N+ @NA [][] }
+
+word 'sleeps': sentence
+word 'john': noun
+"#,
+        )
+        .unwrap();
+        let grammar = load_grammar(path).unwrap().grammar;
+        let outcome = parse_controlled(
+            grammar.clone(),
+            vec![("string".into(), "john sleeps".into())],
+            vec!["ft".into()],
+            ParseOptions {
+                strategy: StrategyChoice::TopDown,
+                heuristic: HeuristicChoice::Zero,
+                stop_at_first_goal: false,
+                diagnose_feature_rejections: true,
+            },
+            ParseControl::new(),
+        )
+        .unwrap();
+        assert!(outcome.rejected_by_features);
+        assert_ne!(
+            outcome.chart.automaton.language_cardinality(),
+            LanguageCardinality::Finite(0)
+        );
+
+        let (tx, rx) = mpsc::channel();
+        let worker = start_chart_language_worker(grammar, outcome.chart.automaton.clone(), tx);
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            LanguageEvent::Ready(_)
+        ));
+        worker.request(0);
+        let item = match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            LanguageEvent::Derivation(item) => item,
+            other => panic!("expected rejected derivation, got {other:?}"),
+        };
+        let tag = item.tag.as_ref().expect("TAG failure presentation");
+        assert!(tag.failure.is_some());
+        let ValuePresentation::Tree(tree) = &tag.derived_tree.value else {
+            panic!("expected rejected derived tree");
+        };
+        assert!(tree.nodes.iter().any(|node| node.conflict));
+        let ValuePresentation::Tree(derivation) = &tag.derivation.value else {
+            panic!("expected rejected derivation tree");
+        };
+        assert!(derivation.nodes.iter().any(|node| node.conflict));
+
+        let raw_outcome = parse_controlled(
+            load_grammar(directory.join("rejected.tag"))
+                .unwrap()
+                .grammar,
+            vec![("string".into(), "john sleeps".into())],
+            vec!["ft".into()],
+            ParseOptions {
+                strategy: StrategyChoice::TopDown,
+                heuristic: HeuristicChoice::Zero,
+                stop_at_first_goal: false,
+                diagnose_feature_rejections: false,
+            },
+            ParseControl::new(),
+        )
+        .unwrap();
+        assert!(!raw_outcome.rejected_by_features);
+        assert_eq!(
+            raw_outcome.chart.automaton.language_cardinality(),
+            LanguageCardinality::Finite(0)
+        );
+    }
+
+    #[test]
+    fn syntactically_impossible_tag_input_is_not_feature_rejection() {
+        let directory =
+            std::env::temp_dir().join(format!("rusty_alto_gui_no_parse_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("empty.tag");
+        std::fs::write(
+            &path,
+            r#"
+tree sentence:
+  S @NA [][] { V+ @NA [][] }
+word 'sleeps': sentence
+"#,
+        )
+        .unwrap();
+        let grammar = load_grammar(path).unwrap().grammar;
+        let outcome = parse_controlled(
+            grammar,
+            vec![("string".into(), "unknown".into())],
+            vec!["ft".into()],
+            ParseOptions {
+                strategy: StrategyChoice::TopDown,
+                heuristic: HeuristicChoice::Zero,
+                stop_at_first_goal: false,
+                diagnose_feature_rejections: true,
+            },
+            ParseControl::new(),
+        )
+        .unwrap();
+        assert!(!outcome.rejected_by_features);
+        assert_eq!(
+            outcome.chart.automaton.language_cardinality(),
+            LanguageCardinality::Finite(0)
+        );
     }
 
     #[test]

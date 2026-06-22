@@ -58,13 +58,31 @@ fn tree_svg(layout: &TreeLayout, width: f32, height: f32) -> Vec<u8> {
             OFFSET_Y + node.y,
             node.width,
             node.height,
-            if node.muted { "#f5f6f8" } else { "#ffffff" },
-            if node.muted { "#cbd1d8" } else { "#d4d9df" },
+            if node.conflict {
+                "#fff1f2"
+            } else if node.muted {
+                "#f5f6f8"
+            } else {
+                "#ffffff"
+            },
+            if node.conflict {
+                "#c93445"
+            } else if node.muted {
+                "#cbd1d8"
+            } else {
+                "#d4d9df"
+            },
         )
         .unwrap();
     }
     for node in &layout.nodes {
-        let color = if node.muted { "#8a949f" } else { "#202733" };
+        let color = if node.conflict {
+            "#9f1f30"
+        } else if node.muted {
+            "#8a949f"
+        } else {
+            "#202733"
+        };
         let mut line_y = OFFSET_Y + node.y + 15.0;
         if let Some(top) = &node.top {
             write!(
@@ -126,6 +144,7 @@ mod tests {
                     top: None,
                     bottom: None,
                     muted: false,
+                    conflict: false,
                     x: 30.0,
                     y: 20.0,
                     width: 58.0,
@@ -136,6 +155,7 @@ mod tests {
                     top: None,
                     bottom: None,
                     muted: false,
+                    conflict: false,
                     x: 30.0,
                     y: 94.0,
                     width: 58.0,

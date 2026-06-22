@@ -4,8 +4,9 @@ use crate::{
     },
     feature_canvas::feature_structure_view,
     model::{
-        ChartDocument, DocumentTab, GrammarDocument, HeuristicChoice, InputField, PresentationMode,
-        RuleColumn, RuleRow, StrategyChoice, ValuePresentation, ViewContent,
+        DocumentTab, FailurePresentation, GrammarDocument, HeuristicChoice, InputField,
+        ParseOutcome, PresentationMode, RuleColumn, RuleRow, StrategyChoice, ValuePresentation,
+        ViewContent,
     },
     theme,
     tree_canvas::tree_view,
@@ -379,7 +380,7 @@ pub enum Message {
     FocusPrevious,
     Parse,
     CancelParse,
-    Parsed(u64, Result<ChartDocument, String>),
+    Parsed(u64, Result<ParseOutcome, String>),
     PreviousDerivation,
     NextDerivation,
     SelectOutput(usize),
@@ -582,6 +583,7 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
                         state.stop_at_first_goal && state.constraint_count() <= 1,
                     )
                 };
+            let diagnose_feature_rejections = state.presentation_mode == PresentationMode::Tag;
             return Task::perform(
                 async move {
                     tokio::task::spawn_blocking(move || {
@@ -589,9 +591,12 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
                             grammar,
                             inputs,
                             required_valid,
-                            strategy,
-                            heuristic,
-                            stop_at_first_goal,
+                            workers::ParseOptions {
+                                strategy,
+                                heuristic,
+                                stop_at_first_goal,
+                                diagnose_feature_rejections,
+                            },
                             control,
                         )
                     })
@@ -620,10 +625,11 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
             }
             state.active_parse = None;
             match result {
-                Ok(chart) => {
+                Ok(outcome) => {
                     let Some(grammar) = &state.grammar else {
                         return Task::none();
                     };
+                    let chart = outcome.chart;
                     let id = state.next_parse_id;
                     state.next_parse_id += 1;
                     let (sender, receiver) = mpsc::channel();
@@ -640,6 +646,7 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
                             .unwrap_or_else(|| "Parsed input".into()),
                         chart,
                         language: LanguageSession::preparing(worker, receiver),
+                        rejected_by_features: outcome.rejected_by_features,
                     });
                     state.selection = Selection::Parse(id);
                     state.active_tab = DocumentTab::Primary;
@@ -981,9 +988,13 @@ fn sidebar(state: &Workbench) -> Element<'_, Message> {
             )
             .clip(true)
             .width(Length::Fill),
-            text(parse.language.sidebar_status())
-                .size(10)
-                .color(theme::MUTED),
+            text(if parse.rejected_by_features {
+                "Rejected by feature constraints".into()
+            } else {
+                parse.language.sidebar_status()
+            })
+            .size(10)
+            .color(theme::MUTED),
         ]
         .spacing(3)
         .padding(iced::Padding {
@@ -1057,13 +1068,19 @@ fn document_button<'a>(
 /// and directly above the content it controls, with a baseline rule.
 fn view_bar<'a>(
     primary_label: &'a str,
+    secondary_label: &'a str,
     active_tab: DocumentTab,
     language_ready: bool,
     extra: Option<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    let mut bar = row![view_selector(primary_label, active_tab, language_ready)]
-        .align_y(Alignment::Center)
-        .spacing(24);
+    let mut bar = row![view_selector(
+        primary_label,
+        secondary_label,
+        active_tab,
+        language_ready
+    )]
+    .align_y(Alignment::Center)
+    .spacing(24);
     if let Some(extra) = extra {
         bar = bar.push(extra);
     }
@@ -1073,6 +1090,7 @@ fn view_bar<'a>(
 /// Prominent two-segment toggle for the primary Grammar/Chart ↔ Language switch.
 fn view_selector<'a>(
     primary_label: &'a str,
+    secondary_label: &'a str,
     active_tab: DocumentTab,
     language_ready: bool,
 ) -> Element<'a, Message> {
@@ -1094,7 +1112,7 @@ fn view_selector<'a>(
         .on_press(Message::SelectTab(DocumentTab::Primary));
 
     let language_active = language_ready && active_tab == DocumentTab::Language;
-    let language = button(segment_label("Language"))
+    let language = button(segment_label(secondary_label))
         .width(Length::Fixed(SEGMENT_WIDTH))
         .padding([7, 10])
         .style(theme::segment(language_active, [0.0, R, R, 0.0]));
@@ -1124,8 +1142,13 @@ fn workspace(state: &Workbench) -> Element<'_, Message> {
                             .map(|grammar| format!("Grammar: {}", display_name(&grammar.path)))
                             .unwrap_or_else(|| "Grammar".into()),
                         "Grammar",
-                        state.presentation_mode,
-                        state.show_technical_nodes,
+                        "Language",
+                        LanguagePageOptions {
+                            mode: state.presentation_mode,
+                            show_technical_nodes: state.show_technical_nodes,
+                            rejected_by_features: false,
+                            wide_inspector: state.viewport_size.width >= 1250.0,
+                        },
                     )
                 })
                 .unwrap_or_else(|| empty_state("No language", "Open a grammar first.", None)),
@@ -1140,8 +1163,17 @@ fn workspace(state: &Workbench) -> Element<'_, Message> {
                     &parse.language,
                     format!("#{}  {}", parse.id, parse.label),
                     "Chart",
-                    state.presentation_mode,
-                    state.show_technical_nodes,
+                    if parse.rejected_by_features {
+                        "Failures"
+                    } else {
+                        "Language"
+                    },
+                    LanguagePageOptions {
+                        mode: state.presentation_mode,
+                        show_technical_nodes: state.show_technical_nodes,
+                        rejected_by_features: parse.rejected_by_features,
+                        wide_inspector: state.viewport_size.width >= 1250.0,
+                    },
                 ),
             }
         }
@@ -1168,7 +1200,7 @@ fn grammar_page(state: &Workbench) -> Element<'_, Message> {
                     grammar.summary.maximum_rank
                 ),
             ),
-            view_bar("Grammar", DocumentTab::Primary, ready, None),
+            view_bar("Grammar", "Language", DocumentTab::Primary, ready, None),
             rule_table(
                 &grammar.rules,
                 &grammar.interpretation_names,
@@ -1182,24 +1214,51 @@ fn grammar_page(state: &Workbench) -> Element<'_, Message> {
 
 fn chart_page(parse: &ParseSession) -> Element<'_, Message> {
     let id = parse.id;
-    page(
-        column![
-            page_heading(
-                format!("#{}  {}", parse.id, parse.label),
-                format!(
-                    "{} chart rules · {} states · built in {:.2?}",
-                    parse.chart.summary.rule_count,
-                    parse.chart.summary.state_count,
-                    parse.chart.elapsed
-                ),
+    let mut content = column![
+        page_heading(
+            format!("#{}  {}", parse.id, parse.label),
+            format!(
+                "{} chart rules · {} states · built in {:.2?}",
+                parse.chart.summary.rule_count,
+                parse.chart.summary.state_count,
+                parse.chart.elapsed
             ),
-            view_bar("Chart", DocumentTab::Primary, parse.language.ready(), None),
-            rule_table(&parse.chart.rules, &[], true, move |column| {
-                Message::SortChart(id, column)
-            }),
-        ]
-        .spacing(theme::SECTION_SPACING),
-    )
+        ),
+        view_bar(
+            "Chart",
+            if parse.rejected_by_features {
+                "Failures"
+            } else {
+                "Language"
+            },
+            DocumentTab::Primary,
+            parse.language.ready(),
+            None
+        ),
+    ]
+    .spacing(theme::SECTION_SPACING);
+    if parse.rejected_by_features {
+        content = content.push(
+            container(
+                column![
+                    text("Rejected by feature constraints").size(14),
+                    text(
+                        "This chart contains sentence-compatible parses before feature filtering."
+                    )
+                    .size(12)
+                    .color(theme::MUTED),
+                ]
+                .spacing(4),
+            )
+            .padding([10, 14])
+            .width(Length::Fill)
+            .style(theme::raised),
+        );
+    }
+    content = content.push(rule_table(&parse.chart.rules, &[], true, move |column| {
+        Message::SortChart(id, column)
+    }));
+    page(content)
 }
 
 fn parse_page(state: &Workbench) -> Element<'_, Message> {
@@ -1332,13 +1391,27 @@ fn parse_page(state: &Workbench) -> Element<'_, Message> {
     page(content)
 }
 
+#[derive(Clone, Copy)]
+struct LanguagePageOptions {
+    mode: PresentationMode,
+    show_technical_nodes: bool,
+    rejected_by_features: bool,
+    wide_inspector: bool,
+}
+
 fn language_page<'a>(
     language: &'a LanguageSession,
     title: String,
     primary_label: &'a str,
-    mode: PresentationMode,
-    show_technical_nodes: bool,
+    secondary_label: &'a str,
+    options: LanguagePageOptions,
 ) -> Element<'a, Message> {
+    let LanguagePageOptions {
+        mode,
+        show_technical_nodes,
+        rejected_by_features,
+        wide_inspector,
+    } = options;
     let derivation = match &language.status {
         LanguageStatus::Ready(LanguageCardinality::Finite(0)) => None,
         LanguageStatus::Ready(_) => language.derivations.get(language.derivation_index),
@@ -1448,7 +1521,7 @@ fn language_page<'a>(
             } else {
                 value
             };
-            let body: Element<'a, Message> = if let Some(term) = &output.term {
+            let mut body: Element<'a, Message> = if let Some(term) = &output.term {
                 // Text values only need their content height. Errors need a
                 // definite region: a Fill-height message inside a Shrink
                 // section otherwise collapses to an empty VALUE panel.
@@ -1476,6 +1549,24 @@ fn language_page<'a>(
                     .style(theme::raised)
                     .into()
             };
+            if rejected_by_features
+                && let Some(failure) = tag_presentation.and_then(|tag| tag.failure.as_ref())
+            {
+                body = if wide_inspector {
+                    row![body, failure_inspector(failure).width(Length::Fixed(360.0)),]
+                        .spacing(theme::SECTION_SPACING)
+                        .height(Length::Fill)
+                        .into()
+                } else {
+                    column![
+                        body,
+                        failure_inspector(failure).height(Length::Fixed(230.0)),
+                    ]
+                    .spacing(theme::SECTION_SPACING)
+                    .height(Length::Fill)
+                    .into()
+                };
+            }
 
             let previous = button(text("‹").size(18)).style(theme::quiet_button);
             let previous = if language.derivation_index > 0 {
@@ -1579,7 +1670,13 @@ fn language_page<'a>(
     page(
         column![
             heading,
-            view_bar(primary_label, DocumentTab::Language, true, extra),
+            view_bar(
+                primary_label,
+                secondary_label,
+                DocumentTab::Language,
+                true,
+                extra
+            ),
             body,
         ]
         .spacing(theme::SECTION_SPACING),
@@ -1603,6 +1700,34 @@ fn panel_section<'a>(
     .width(Length::Fill)
     .height(height)
     .into()
+}
+
+fn failure_inspector(failure: &FailurePresentation) -> iced::widget::Container<'_, Message> {
+    let mut values = column![
+        text("CONFLICT").size(10).color(theme::DANGER),
+        text(&failure.title).size(17),
+        text(format!("Path: {}", failure.path))
+            .size(11)
+            .color(theme::MUTED),
+        text(format!("Operation: {}", failure.operation))
+            .size(11)
+            .color(theme::MUTED),
+        rule::horizontal(1).style(theme::separator),
+        text("LEFT").size(10).color(theme::MUTED),
+        text(&failure.left).size(13),
+        text(&failure.left_origin).size(11).color(theme::MUTED),
+    ]
+    .spacing(7);
+    if !failure.right.is_empty() {
+        values = values
+            .push(rule::horizontal(1).style(theme::separator))
+            .push(text("RIGHT").size(10).color(theme::MUTED))
+            .push(text(&failure.right).size(13))
+            .push(text(&failure.right_origin).size(11).color(theme::MUTED));
+    }
+    container(scrollable(values.padding(14)))
+        .height(Length::Fill)
+        .style(theme::raised)
 }
 
 /// A centered status message filling the content panel (loading / error / empty).

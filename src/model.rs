@@ -194,6 +194,7 @@ pub struct TreeNode {
     pub top: Option<String>,
     pub bottom: Option<String>,
     pub muted: bool,
+    pub conflict: bool,
     pub x: f32,
     pub y: f32,
     pub width: f32,
@@ -275,4 +276,22 @@ pub struct TagPresentation {
     pub derived_tree: ViewContent,
     pub derivation: ViewContent,
     pub derivation_with_technical: ViewContent,
+    pub failure: Option<FailurePresentation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FailurePresentation {
+    pub title: String,
+    pub path: String,
+    pub left: String,
+    pub right: String,
+    pub left_origin: String,
+    pub right_origin: String,
+    pub operation: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParseOutcome {
+    pub chart: ChartDocument,
+    pub rejected_by_features: bool,
 }

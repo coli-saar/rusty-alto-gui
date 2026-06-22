@@ -61,6 +61,7 @@ pub(crate) struct ParseSession {
     pub(crate) label: String,
     pub(crate) chart: ChartDocument,
     pub(crate) language: LanguageSession,
+    pub(crate) rejected_by_features: bool,
 }
 
 pub(crate) struct LanguageSession {

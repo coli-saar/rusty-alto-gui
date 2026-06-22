@@ -1,6 +1,10 @@
 use packed_term_arena::tree::{Tree, TreeArena};
-use rusty_alto::{FeatureStructure, FeatureStructureAlgebra, HomLabel, Homomorphism, Irtg, Symbol};
-use std::{error::Error, fmt};
+use rusty_alto::{FeatureStructure, HomLabel, Homomorphism, Irtg, Symbol};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 #[derive(Debug, Clone)]
 pub struct AnnotatedTree {
@@ -10,12 +14,56 @@ pub struct AnnotatedTree {
     pub children: Vec<AnnotatedTree>,
     pub provenance: NodeProvenance,
     pub foot: bool,
+    pub conflict: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeProvenance {
     pub derivation_path: Vec<usize>,
     pub local_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FeatureOrigin {
+    pub derivation_path: Vec<usize>,
+    pub grammar_symbol: String,
+    pub local_key: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum FeatureFailureKind {
+    Unification {
+        path: Vec<String>,
+        left: FeatureStructure,
+        right: FeatureStructure,
+        left_origins: Vec<FeatureOrigin>,
+        right_origins: Vec<FeatureOrigin>,
+    },
+    Projection {
+        attribute: String,
+        origin: FeatureOrigin,
+    },
+    Remapping {
+        specification: String,
+        origin: FeatureOrigin,
+    },
+    InvalidOperation {
+        operation: String,
+        origin: FeatureOrigin,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct FeatureFailure {
+    pub operation: String,
+    pub at: FeatureOrigin,
+    pub kind: Box<FeatureFailureKind>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TagDiagnostic {
+    pub tree: AnnotatedTree,
+    pub failure: FeatureFailure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,19 +138,42 @@ pub fn fold_tag_derivation(
     derivation: &TreeArena<Symbol>,
     root: Tree,
 ) -> Result<AnnotatedTree, TagFoldError> {
-    if grammar.interpretation_ref("tree").is_none() {
-        return Err(TagFoldError::MissingInterpretation("tree"));
+    if grammar.interpretation_ref("ft").is_none() {
+        return Err(TagFoldError::MissingInterpretation("ft"));
     }
-    let features = grammar
-        .interpretation::<FeatureStructureAlgebra>("ft")
-        .map_err(|_| TagFoldError::MissingInterpretation("ft"))?;
     let mut path = Vec::new();
-    fold_node(grammar, &features, derivation, root, &mut path)
+    let tree = fold_node(grammar, derivation, root, &mut path)?;
+    match evaluate_feature_derivation(grammar, derivation, root, &[]) {
+        Ok(_) => Ok(tree),
+        Err(failure) => Err(TagFoldError::FeatureEvaluation(format_failure(&failure))),
+    }
+}
+
+pub fn diagnose_tag_derivation(
+    grammar: &Irtg,
+    derivation: &TreeArena<Symbol>,
+    root: Tree,
+) -> Result<TagDiagnostic, TagFoldError> {
+    if grammar.interpretation_ref("ft").is_none() {
+        return Err(TagFoldError::MissingInterpretation("ft"));
+    }
+    let mut path = Vec::new();
+    let mut tree = fold_node(grammar, derivation, root, &mut path)?;
+    let failure = evaluate_feature_derivation(grammar, derivation, root, &[])
+        .err()
+        .ok_or_else(|| {
+            TagFoldError::FeatureEvaluation("feature interpretation evaluated successfully".into())
+        })?;
+    let highlighted = failure_origins(&failure)
+        .into_iter()
+        .map(|origin| origin.derivation_path)
+        .collect::<BTreeSet<_>>();
+    mark_conflicts(&mut tree, &highlighted);
+    Ok(TagDiagnostic { tree, failure })
 }
 
 fn fold_node(
     grammar: &Irtg,
-    features: &rusty_alto::TypedInterpretation<'_, FeatureStructureAlgebra>,
     derivation: &TreeArena<Symbol>,
     node: Tree,
     path: &mut Vec<usize>,
@@ -112,9 +183,9 @@ fn fold_node(
         .grammar_signature()
         .resolve(source_symbol)
         .to_owned();
-    let feature_value = features
-        .interpret_derivation(derivation, node)
-        .map_err(|error| TagFoldError::FeatureEvaluation(error.to_string()))?;
+    let feature_value = evaluate_feature_derivation(grammar, derivation, node, path)
+        .ok()
+        .map(|value| value.value);
 
     let tree_interpretation = grammar
         .interpretation_ref("tree")
@@ -134,10 +205,16 @@ fn fold_node(
     let mut folded_children = Vec::new();
     for (index, &child) in derivation.get_children(node).iter().enumerate() {
         path.push(index);
-        folded_children.push(fold_node(grammar, features, derivation, child, path)?);
+        folded_children.push(fold_node(grammar, derivation, child, path)?);
         path.pop();
     }
-    instantiate(&template, &feature_value, &folded_children, path, true)
+    instantiate(
+        &template,
+        feature_value.as_ref(),
+        &folded_children,
+        path,
+        true,
+    )
 }
 
 fn decode_template(
@@ -241,7 +318,7 @@ fn assign_keys(template: &mut Template, next: &mut usize) {
 
 fn instantiate(
     template: &Template,
-    features: &FeatureStructure,
+    features: Option<&FeatureStructure>,
     derivation_children: &[AnnotatedTree],
     path: &[usize],
     elementary_root: bool,
@@ -257,10 +334,11 @@ fn instantiate(
                 local_key: String::new(),
             },
             foot: false,
+            conflict: false,
         }),
         Template::Foot => Ok(AnnotatedTree {
             label: "*".into(),
-            top: features.project("foot"),
+            top: features.and_then(|value| value.project("foot")),
             bottom: None,
             children: Vec::new(),
             provenance: NodeProvenance {
@@ -268,6 +346,7 @@ fn instantiate(
                 local_key: "foot".into(),
             },
             foot: true,
+            conflict: false,
         }),
         Template::Substitution { child, key } => {
             let mut replacement =
@@ -278,7 +357,7 @@ fn instantiate(
                         variable: *child,
                         child_count: derivation_children.len(),
                     })?;
-            replacement.top = features.project(key);
+            replacement.top = features.and_then(|value| value.project(key));
             Ok(replacement)
         }
         Template::Ordinary {
@@ -294,15 +373,16 @@ fn instantiate(
             let ordinary = AnnotatedTree {
                 label: label.clone(),
                 top: (!elementary_root)
-                    .then(|| features.project(&format!("{key}t")))
+                    .then(|| features.and_then(|value| value.project(&format!("{key}t"))))
                     .flatten(),
-                bottom: features.project(&format!("{key}b")),
+                bottom: features.and_then(|value| value.project(&format!("{key}b"))),
                 children,
                 provenance: NodeProvenance {
                     derivation_path: path.to_vec(),
                     local_key: key.clone(),
                 },
                 foot: false,
+                conflict: false,
             };
             if let Some(child) = adjunction_child {
                 let auxiliary =
@@ -325,6 +405,430 @@ fn instantiate(
             } else {
                 Ok(ordinary)
             }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TracedValue {
+    value: FeatureStructure,
+    origins: BTreeMap<Vec<String>, Vec<FeatureOrigin>>,
+}
+
+fn evaluate_feature_derivation(
+    grammar: &Irtg,
+    derivation: &TreeArena<Symbol>,
+    node: Tree,
+    path: &[usize],
+) -> Result<TracedValue, FeatureFailure> {
+    let interpretation = grammar.interpretation_ref("ft").ok_or_else(|| {
+        missing_feature_failure(grammar, derivation, node, path, "missing ft interpretation")
+    })?;
+    let source = *derivation.get_label(node);
+    let symbol_name = grammar.grammar_signature().resolve(source).to_owned();
+    let term = interpretation
+        .homomorphism()
+        .get(source)
+        .ok_or_else(|| FeatureFailure {
+            operation: "homomorphism".into(),
+            at: FeatureOrigin {
+                derivation_path: path.to_vec(),
+                grammar_symbol: symbol_name.clone(),
+                local_key: String::new(),
+            },
+            kind: Box::new(FeatureFailureKind::InvalidOperation {
+                operation: "missing feature homomorphism".into(),
+                origin: FeatureOrigin {
+                    derivation_path: path.to_vec(),
+                    grammar_symbol: symbol_name.clone(),
+                    local_key: String::new(),
+                },
+            }),
+        })?;
+    let mut children = Vec::new();
+    for (index, &child) in derivation.get_children(node).iter().enumerate() {
+        let mut child_path = path.to_vec();
+        child_path.push(index);
+        children.push(evaluate_feature_derivation(
+            grammar,
+            derivation,
+            child,
+            &child_path,
+        )?);
+    }
+    evaluate_feature_term(
+        interpretation.homomorphism(),
+        interpretation.algebra_signature(),
+        term,
+        &children,
+        &FeatureOrigin {
+            derivation_path: path.to_vec(),
+            grammar_symbol: symbol_name,
+            local_key: String::new(),
+        },
+    )
+}
+
+fn evaluate_feature_term(
+    homomorphism: &Homomorphism,
+    signature: &rusty_alto::Signature,
+    node: Tree,
+    children: &[TracedValue],
+    at: &FeatureOrigin,
+) -> Result<TracedValue, FeatureFailure> {
+    let arena = homomorphism.arena();
+    match *arena.get_label(node) {
+        HomLabel::Var(index) => children.get(index).cloned().ok_or_else(|| FeatureFailure {
+            operation: format!("?{}", index + 1),
+            at: at.clone(),
+            kind: Box::new(FeatureFailureKind::InvalidOperation {
+                operation: "feature variable is out of range".into(),
+                origin: at.clone(),
+            }),
+        }),
+        HomLabel::Symbol(symbol) => {
+            let label = signature.resolve(symbol);
+            let arguments = arena
+                .get_children(node)
+                .iter()
+                .map(|&child| evaluate_feature_term(homomorphism, signature, child, children, at))
+                .collect::<Result<Vec<_>, _>>()?;
+            match (label, arguments.as_slice()) {
+                ("unify", [left, right]) => {
+                    if let Some(value) = left.value.unify(&right.value) {
+                        Ok(TracedValue {
+                            value,
+                            origins: merge_origins(&left.origins, &right.origins),
+                        })
+                    } else {
+                        let path = first_conflict_path(&left.value, &right.value);
+                        let left_value =
+                            project_path(&left.value, &path).unwrap_or_else(|| left.value.clone());
+                        let right_value = project_path(&right.value, &path)
+                            .unwrap_or_else(|| right.value.clone());
+                        Err(FeatureFailure {
+                            operation: "unify".into(),
+                            at: at.clone(),
+                            kind: Box::new(FeatureFailureKind::Unification {
+                                left_origins: origins_at(&left.origins, &path),
+                                right_origins: origins_at(&right.origins, &path),
+                                path,
+                                left: left_value,
+                                right: right_value,
+                            }),
+                        })
+                    }
+                }
+                (_, [value]) if label.starts_with("proj_") => {
+                    let attribute = &label["proj_".len()..];
+                    let projected =
+                        value
+                            .value
+                            .project(attribute)
+                            .ok_or_else(|| FeatureFailure {
+                                operation: label.to_owned(),
+                                at: at.clone(),
+                                kind: Box::new(FeatureFailureKind::Projection {
+                                    attribute: attribute.to_owned(),
+                                    origin: first_origin(value, at),
+                                }),
+                            })?;
+                    Ok(TracedValue {
+                        value: projected,
+                        origins: project_origins(&value.origins, attribute),
+                    })
+                }
+                (_, [value]) if label.starts_with("emb_") => {
+                    let attribute = &label["emb_".len()..];
+                    Ok(TracedValue {
+                        value: value.value.embed(attribute),
+                        origins: prefix_origins(&value.origins, attribute),
+                    })
+                }
+                (_, [value]) if label.starts_with("remap_") => {
+                    let specification = &label["remap_".len()..];
+                    let mappings =
+                        parse_remappings(specification).ok_or_else(|| FeatureFailure {
+                            operation: label.to_owned(),
+                            at: at.clone(),
+                            kind: Box::new(FeatureFailureKind::Remapping {
+                                specification: specification.to_owned(),
+                                origin: first_origin(value, at),
+                            }),
+                        })?;
+                    let borrowed = mappings
+                        .iter()
+                        .map(|(source, target)| (source.as_str(), target.as_str()))
+                        .collect::<Vec<_>>();
+                    let remapped = value.value.remap(&borrowed).ok_or_else(|| FeatureFailure {
+                        operation: label.to_owned(),
+                        at: at.clone(),
+                        kind: Box::new(FeatureFailureKind::Remapping {
+                            specification: specification.to_owned(),
+                            origin: first_origin(value, at),
+                        }),
+                    })?;
+                    Ok(TracedValue {
+                        value: remapped,
+                        origins: remap_origins(&value.origins, &mappings),
+                    })
+                }
+                (_, []) => {
+                    let value = FeatureStructure::parse(label).map_err(|_| FeatureFailure {
+                        operation: label.to_owned(),
+                        at: at.clone(),
+                        kind: Box::new(FeatureFailureKind::InvalidOperation {
+                            operation: label.to_owned(),
+                            origin: at.clone(),
+                        }),
+                    })?;
+                    Ok(TracedValue {
+                        origins: literal_origins(&value, at),
+                        value,
+                    })
+                }
+                _ => Err(FeatureFailure {
+                    operation: label.to_owned(),
+                    at: at.clone(),
+                    kind: Box::new(FeatureFailureKind::InvalidOperation {
+                        operation: label.to_owned(),
+                        origin: at.clone(),
+                    }),
+                }),
+            }
+        }
+    }
+}
+
+fn literal_origins(
+    value: &FeatureStructure,
+    at: &FeatureOrigin,
+) -> BTreeMap<Vec<String>, Vec<FeatureOrigin>> {
+    fn visit(
+        value: &FeatureStructure,
+        node: rusty_alto::FeatureStructureNodeId,
+        path: &mut Vec<String>,
+        at: &FeatureOrigin,
+        origins: &mut BTreeMap<Vec<String>, Vec<FeatureOrigin>>,
+    ) {
+        let mut origin = at.clone();
+        origin.local_key = path.first().cloned().unwrap_or_default();
+        origins.entry(path.clone()).or_default().push(origin);
+        if let Some(attributes) = value.attributes(node) {
+            for attribute in attributes {
+                path.push(attribute.name.to_owned());
+                visit(value, attribute.value, path, at, origins);
+                path.pop();
+            }
+        }
+    }
+    let mut origins = BTreeMap::new();
+    visit(value, value.root(), &mut Vec::new(), at, &mut origins);
+    origins
+}
+
+fn merge_origins(
+    left: &BTreeMap<Vec<String>, Vec<FeatureOrigin>>,
+    right: &BTreeMap<Vec<String>, Vec<FeatureOrigin>>,
+) -> BTreeMap<Vec<String>, Vec<FeatureOrigin>> {
+    let mut merged = left.clone();
+    for (path, origins) in right {
+        merged
+            .entry(path.clone())
+            .or_default()
+            .extend(origins.iter().cloned());
+    }
+    for origins in merged.values_mut() {
+        origins.sort();
+        origins.dedup();
+    }
+    merged
+}
+
+fn project_origins(
+    origins: &BTreeMap<Vec<String>, Vec<FeatureOrigin>>,
+    attribute: &str,
+) -> BTreeMap<Vec<String>, Vec<FeatureOrigin>> {
+    origins
+        .iter()
+        .filter(|(path, _)| path.first().is_some_and(|item| item == attribute))
+        .map(|(path, values)| (path[1..].to_vec(), values.clone()))
+        .collect()
+}
+
+fn prefix_origins(
+    origins: &BTreeMap<Vec<String>, Vec<FeatureOrigin>>,
+    attribute: &str,
+) -> BTreeMap<Vec<String>, Vec<FeatureOrigin>> {
+    origins
+        .iter()
+        .map(|(path, values)| {
+            let mut prefixed = vec![attribute.to_owned()];
+            prefixed.extend(path.iter().cloned());
+            (prefixed, values.clone())
+        })
+        .collect()
+}
+
+fn remap_origins(
+    origins: &BTreeMap<Vec<String>, Vec<FeatureOrigin>>,
+    mappings: &[(String, String)],
+) -> BTreeMap<Vec<String>, Vec<FeatureOrigin>> {
+    let mut remapped = BTreeMap::new();
+    for (source, target) in mappings {
+        for (path, values) in origins {
+            if path.first() == Some(source) {
+                let mut new_path = vec![target.clone()];
+                new_path.extend(path.iter().skip(1).cloned());
+                remapped.insert(new_path, values.clone());
+            }
+        }
+    }
+    remapped
+}
+
+fn parse_remappings(specification: &str) -> Option<Vec<(String, String)>> {
+    specification
+        .split(',')
+        .map(|item| {
+            let (source, target) = item.split_once('=')?;
+            (!source.is_empty() && !target.is_empty())
+                .then(|| (source.to_owned(), target.to_owned()))
+        })
+        .collect()
+}
+
+fn first_conflict_path(left: &FeatureStructure, right: &FeatureStructure) -> Vec<String> {
+    use rusty_alto::FeatureStructureNode;
+    fn descend(
+        left: &FeatureStructure,
+        left_node: rusty_alto::FeatureStructureNodeId,
+        right: &FeatureStructure,
+        right_node: rusty_alto::FeatureStructureNodeId,
+        path: &mut Vec<String>,
+    ) -> bool {
+        match (left.node(left_node), right.node(right_node)) {
+            (Some(FeatureStructureNode::Variable), _)
+            | (_, Some(FeatureStructureNode::Variable)) => false,
+            (Some(FeatureStructureNode::Atom(a)), Some(FeatureStructureNode::Atom(b))) => a != b,
+            (Some(FeatureStructureNode::Map), Some(FeatureStructureNode::Map)) => {
+                let left_attributes = left
+                    .attributes(left_node)
+                    .into_iter()
+                    .flatten()
+                    .map(|attribute| (attribute.name.to_owned(), attribute.value))
+                    .collect::<BTreeMap<_, _>>();
+                for attribute in right.attributes(right_node).into_iter().flatten() {
+                    if let Some(&left_child) = left_attributes.get(attribute.name) {
+                        path.push(attribute.name.to_owned());
+                        if descend(left, left_child, right, attribute.value, path) {
+                            return true;
+                        }
+                        path.pop();
+                    }
+                }
+                false
+            }
+            _ => true,
+        }
+    }
+    let mut path = Vec::new();
+    let _ = descend(left, left.root(), right, right.root(), &mut path);
+    path
+}
+
+fn project_path(value: &FeatureStructure, path: &[String]) -> Option<FeatureStructure> {
+    path.iter()
+        .try_fold(value.clone(), |value, attribute| value.project(attribute))
+}
+
+fn origins_at(
+    origins: &BTreeMap<Vec<String>, Vec<FeatureOrigin>>,
+    path: &[String],
+) -> Vec<FeatureOrigin> {
+    for length in (0..=path.len()).rev() {
+        if let Some(found) = origins.get(&path[..length]) {
+            return found.clone();
+        }
+    }
+    Vec::new()
+}
+
+fn first_origin(value: &TracedValue, fallback: &FeatureOrigin) -> FeatureOrigin {
+    value
+        .origins
+        .values()
+        .flatten()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| fallback.clone())
+}
+
+fn missing_feature_failure(
+    grammar: &Irtg,
+    derivation: &TreeArena<Symbol>,
+    node: Tree,
+    path: &[usize],
+    operation: &str,
+) -> FeatureFailure {
+    let origin = FeatureOrigin {
+        derivation_path: path.to_vec(),
+        grammar_symbol: grammar
+            .grammar_signature()
+            .resolve(*derivation.get_label(node))
+            .to_owned(),
+        local_key: String::new(),
+    };
+    FeatureFailure {
+        operation: operation.into(),
+        at: origin.clone(),
+        kind: Box::new(FeatureFailureKind::InvalidOperation {
+            operation: operation.into(),
+            origin,
+        }),
+    }
+}
+
+fn failure_origins(failure: &FeatureFailure) -> Vec<FeatureOrigin> {
+    match failure.kind.as_ref() {
+        FeatureFailureKind::Unification {
+            left_origins,
+            right_origins,
+            ..
+        } => left_origins.iter().chain(right_origins).cloned().collect(),
+        FeatureFailureKind::Projection { origin, .. }
+        | FeatureFailureKind::Remapping { origin, .. }
+        | FeatureFailureKind::InvalidOperation { origin, .. } => vec![origin.clone()],
+    }
+}
+
+fn mark_conflicts(tree: &mut AnnotatedTree, paths: &BTreeSet<Vec<usize>>) {
+    tree.conflict = paths.contains(&tree.provenance.derivation_path);
+    for child in &mut tree.children {
+        mark_conflicts(child, paths);
+    }
+}
+
+fn format_failure(failure: &FeatureFailure) -> String {
+    match failure.kind.as_ref() {
+        FeatureFailureKind::Unification {
+            path, left, right, ..
+        } => format!(
+            "unification failed at {}: {left} conflicts with {right}",
+            if path.is_empty() {
+                "<root>".into()
+            } else {
+                path.join(".")
+            }
+        ),
+        FeatureFailureKind::Projection { attribute, .. } => {
+            format!("projection {attribute:?} failed")
+        }
+        FeatureFailureKind::Remapping { specification, .. } => {
+            format!("remapping {specification:?} failed")
+        }
+        FeatureFailureKind::InvalidOperation { operation, .. } => {
+            format!("feature operation {operation:?} failed")
         }
     }
 }
@@ -354,7 +858,7 @@ fn replace_foot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusty_alto::{InputCodec, TulipacInputCodec};
+    use rusty_alto::{InputCodec, TulipacInputCodec, parse_irtg};
 
     const SUBSTITUTION_TAG: &str = r#"
 tree sentence:
@@ -397,6 +901,17 @@ tree noun:
 word 'runs': sentence
 word 'john': phrase
 word 'name': noun
+"#;
+
+    const CONFLICTING_TAG: &str = r#"
+tree sentence:
+  S @NA [][] { NP! [case=nom][] V+ @NA [][] }
+
+tree noun:
+  NP @NA [case=acc][] { N+ @NA [][] }
+
+word 'sleeps': sentence
+word 'john': noun
 "#;
 
     fn first_folded(grammar_text: &str) -> AnnotatedTree {
@@ -538,5 +1053,77 @@ word 'sleeps': sentence
         );
         assert_eq!(np.provenance.derivation_path, vec![0]);
         assert_eq!(noun.provenance.derivation_path, vec![0, 0]);
+    }
+
+    #[test]
+    fn diagnostic_reports_first_atomic_clash_with_origins() {
+        let grammar = TulipacInputCodec::new().decode(CONFLICTING_TAG).unwrap();
+        let mut language = grammar.grammar().sorted_language();
+        let weighted = language.next().unwrap();
+        let (arena, root) = language.clone_tree(weighted.tree());
+        let diagnostic = diagnose_tag_derivation(&grammar, &arena, root).unwrap();
+        let FeatureFailureKind::Unification {
+            path,
+            left,
+            right,
+            left_origins,
+            right_origins,
+        } = diagnostic.failure.kind.as_ref()
+        else {
+            panic!("expected a unification conflict");
+        };
+        assert!(path.ends_with(&["case".to_owned()]), "{path:?}");
+        assert_ne!(left.to_string(), right.to_string());
+        assert!(!left_origins.is_empty());
+        assert!(!right_origins.is_empty());
+        assert!(
+            diagnostic.tree.conflict || diagnostic.tree.children.iter().any(|node| node.conflict)
+        );
+    }
+
+    #[test]
+    fn diagnostic_reports_nested_conflict_path() {
+        let left = FeatureStructure::parse("[agreement: [case: nom, number: sg]]").unwrap();
+        let right = FeatureStructure::parse("[agreement: [case: acc, number: sg]]").unwrap();
+        assert_eq!(
+            first_conflict_path(&left, &right),
+            vec!["agreement".to_owned(), "case".to_owned()]
+        );
+    }
+
+    #[test]
+    fn diagnostic_distinguishes_projection_and_remapping_failures() {
+        fn diagnose(ft_term: &str) -> FeatureFailureKind {
+            let grammar = parse_irtg(
+                format!(
+                    r#"
+interpretation tree: de.up.ling.irtg.algebra.TagTreeAlgebra
+interpretation ft: de.up.ling.irtg.algebra.FeatureStructureAlgebra
+S! -> bad
+  [tree] S_0
+  [ft] {ft_term}
+"#
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            let mut language = grammar.grammar().sorted_language();
+            let weighted = language.next().unwrap();
+            let (arena, root) = language.clone_tree(weighted.tree());
+            *diagnose_tag_derivation(&grammar, &arena, root)
+                .unwrap()
+                .failure
+                .kind
+        }
+
+        assert!(matches!(
+            diagnose(r#"proj_missing("[present: yes]")"#),
+            FeatureFailureKind::Projection { attribute, .. } if attribute == "missing"
+        ));
+        assert!(matches!(
+            diagnose(r#"'remap_missing=target'("[present: yes]")"#),
+            FeatureFailureKind::Remapping { specification, .. }
+                if specification == "missing=target"
+        ));
     }
 }
