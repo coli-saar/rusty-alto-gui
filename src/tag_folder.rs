@@ -1,10 +1,6 @@
 use packed_term_arena::tree::{Tree, TreeArena};
 use rusty_alto::{FeatureStructure, HomLabel, Homomorphism, Irtg, Symbol};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    error::Error,
-    fmt,
-};
+use std::{collections::BTreeMap, error::Error, fmt};
 
 #[derive(Debug, Clone)]
 pub struct AnnotatedTree {
@@ -13,8 +9,25 @@ pub struct AnnotatedTree {
     pub bottom: Option<FeatureStructure>,
     pub children: Vec<AnnotatedTree>,
     pub provenance: NodeProvenance,
+    pub provenance_aliases: Vec<NodeProvenance>,
+    pub top_provenance: Option<NodeProvenance>,
+    pub bottom_provenance: Option<NodeProvenance>,
     pub foot: bool,
-    pub conflict: bool,
+    pub technical: bool,
+    pub conflict: ConflictSide,
+    pub top_source: ConflictSide,
+    pub bottom_source: ConflictSide,
+    pub top_conflict: bool,
+    pub bottom_conflict: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConflictSide {
+    #[default]
+    None,
+    Left,
+    Right,
+    Both,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,11 +177,7 @@ pub fn diagnose_tag_derivation(
         .ok_or_else(|| {
             TagFoldError::FeatureEvaluation("feature interpretation evaluated successfully".into())
         })?;
-    let highlighted = failure_origins(&failure)
-        .into_iter()
-        .map(|origin| origin.derivation_path)
-        .collect::<BTreeSet<_>>();
-    mark_conflicts(&mut tree, &highlighted);
+    mark_conflicts(&mut tree, &failure);
     Ok(TagDiagnostic { tree, failure })
 }
 
@@ -183,9 +192,11 @@ fn fold_node(
         .grammar_signature()
         .resolve(source_symbol)
         .to_owned();
+    let technical_symbol = symbol_name.starts_with("*NOP*");
     let feature_value = evaluate_feature_derivation(grammar, derivation, node, path)
         .ok()
-        .map(|value| value.value);
+        .map(|value| value.value)
+        .or_else(|| evaluate_local_feature_literals(grammar, source_symbol));
 
     let tree_interpretation = grammar
         .interpretation_ref("tree")
@@ -208,11 +219,18 @@ fn fold_node(
         folded_children.push(fold_node(grammar, derivation, child, path)?);
         path.pop();
     }
+    let feature_owner_path = if technical_symbol && !path.is_empty() {
+        &path[..path.len() - 1]
+    } else {
+        path.as_slice()
+    };
     instantiate(
         &template,
         feature_value.as_ref(),
         &folded_children,
         path,
+        feature_owner_path,
+        technical_symbol,
         true,
     )
 }
@@ -321,6 +339,8 @@ fn instantiate(
     features: Option<&FeatureStructure>,
     derivation_children: &[AnnotatedTree],
     path: &[usize],
+    feature_owner_path: &[usize],
+    technical: bool,
     elementary_root: bool,
 ) -> Result<AnnotatedTree, TagFoldError> {
     match template {
@@ -333,8 +353,16 @@ fn instantiate(
                 derivation_path: path.to_vec(),
                 local_key: String::new(),
             },
+            provenance_aliases: Vec::new(),
+            top_provenance: None,
+            bottom_provenance: None,
             foot: false,
-            conflict: false,
+            technical,
+            conflict: ConflictSide::None,
+            top_source: ConflictSide::None,
+            bottom_source: ConflictSide::None,
+            top_conflict: false,
+            bottom_conflict: false,
         }),
         Template::Foot => Ok(AnnotatedTree {
             label: "*".into(),
@@ -345,8 +373,19 @@ fn instantiate(
                 derivation_path: path.to_vec(),
                 local_key: "foot".into(),
             },
+            provenance_aliases: Vec::new(),
+            top_provenance: Some(NodeProvenance {
+                derivation_path: feature_owner_path.to_vec(),
+                local_key: "foot".into(),
+            }),
+            bottom_provenance: None,
             foot: true,
-            conflict: false,
+            technical,
+            conflict: ConflictSide::None,
+            top_source: ConflictSide::None,
+            bottom_source: ConflictSide::None,
+            top_conflict: false,
+            bottom_conflict: false,
         }),
         Template::Substitution { child, key } => {
             let mut replacement =
@@ -357,7 +396,15 @@ fn instantiate(
                         variable: *child,
                         child_count: derivation_children.len(),
                     })?;
+            replacement.provenance_aliases.push(NodeProvenance {
+                derivation_path: path.to_vec(),
+                local_key: key.clone(),
+            });
             replacement.top = features.and_then(|value| value.project(key));
+            replacement.top_provenance = replacement.top.as_ref().map(|_| NodeProvenance {
+                derivation_path: path.to_vec(),
+                local_key: key.clone(),
+            });
             Ok(replacement)
         }
         Template::Ordinary {
@@ -368,21 +415,53 @@ fn instantiate(
         } => {
             let children = children
                 .iter()
-                .map(|child| instantiate(child, features, derivation_children, path, false))
+                .map(|child| {
+                    instantiate(
+                        child,
+                        features,
+                        derivation_children,
+                        path,
+                        feature_owner_path,
+                        technical,
+                        false,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?;
+            let top = (!elementary_root)
+                .then(|| features.and_then(|value| value.project(&format!("{key}t"))))
+                .flatten();
+            let bottom = features.and_then(|value| value.project(&format!("{key}b")));
             let ordinary = AnnotatedTree {
                 label: label.clone(),
-                top: (!elementary_root)
-                    .then(|| features.and_then(|value| value.project(&format!("{key}t"))))
-                    .flatten(),
-                bottom: features.and_then(|value| value.project(&format!("{key}b"))),
+                top: top.clone(),
+                bottom: bottom.clone(),
                 children,
                 provenance: NodeProvenance {
                     derivation_path: path.to_vec(),
                     local_key: key.clone(),
                 },
+                provenance_aliases: elementary_root
+                    .then(|| NodeProvenance {
+                        derivation_path: path.to_vec(),
+                        local_key: "root".into(),
+                    })
+                    .into_iter()
+                    .collect(),
+                top_provenance: top.as_ref().map(|_| NodeProvenance {
+                    derivation_path: feature_owner_path.to_vec(),
+                    local_key: format!("{key}t"),
+                }),
+                bottom_provenance: bottom.as_ref().map(|_| NodeProvenance {
+                    derivation_path: feature_owner_path.to_vec(),
+                    local_key: format!("{key}b"),
+                }),
                 foot: false,
-                conflict: false,
+                technical,
+                conflict: ConflictSide::None,
+                top_source: ConflictSide::None,
+                bottom_source: ConflictSide::None,
+                top_conflict: false,
+                bottom_conflict: false,
             };
             if let Some(child) = adjunction_child {
                 let auxiliary =
@@ -413,6 +492,37 @@ fn instantiate(
 struct TracedValue {
     value: FeatureStructure,
     origins: BTreeMap<Vec<String>, Vec<FeatureOrigin>>,
+}
+
+fn evaluate_local_feature_literals(grammar: &Irtg, source: Symbol) -> Option<FeatureStructure> {
+    let interpretation = grammar.interpretation_ref("ft")?;
+    let homomorphism = interpretation.homomorphism();
+    let term = homomorphism.get(source)?;
+    let signature = interpretation.algebra_signature();
+    let arena = homomorphism.arena();
+
+    fn collect(
+        arena: &TreeArena<HomLabel>,
+        signature: &rusty_alto::Signature,
+        node: Tree,
+        values: &mut Vec<FeatureStructure>,
+    ) {
+        if let HomLabel::Symbol(symbol) = *arena.get_label(node)
+            && arena.get_children(node).is_empty()
+            && let Ok(value) = FeatureStructure::parse(signature.resolve(symbol))
+        {
+            values.push(value);
+        }
+        for &child in arena.get_children(node) {
+            collect(arena, signature, child, values);
+        }
+    }
+
+    let mut values = Vec::new();
+    collect(arena, signature, term, &mut values);
+    values
+        .into_iter()
+        .reduce(|left, right| left.unify(&right).unwrap_or(left))
 }
 
 fn evaluate_feature_derivation(
@@ -502,9 +612,14 @@ fn evaluate_feature_term(
                         })
                     } else {
                         let path = first_conflict_path(&left.value, &right.value);
-                        let left_value =
-                            project_path(&left.value, &path).unwrap_or_else(|| left.value.clone());
-                        let right_value = project_path(&right.value, &path)
+                        let local_path = path
+                            .first()
+                            .filter(|key| key.starts_with('n') || key.as_str() == "foot")
+                            .map(std::slice::from_ref)
+                            .unwrap_or_default();
+                        let left_value = project_path(&left.value, local_path)
+                            .unwrap_or_else(|| left.value.clone());
+                        let right_value = project_path(&right.value, local_path)
                             .unwrap_or_else(|| right.value.clone());
                         Err(FeatureFailure {
                             operation: "unify".into(),
@@ -789,23 +904,114 @@ fn missing_feature_failure(
     }
 }
 
-fn failure_origins(failure: &FeatureFailure) -> Vec<FeatureOrigin> {
-    match failure.kind.as_ref() {
+fn mark_conflicts(tree: &mut AnnotatedTree, failure: &FeatureFailure) {
+    let (left, right, left_value, right_value, conflict_path) = match failure.kind.as_ref() {
         FeatureFailureKind::Unification {
             left_origins,
             right_origins,
+            left,
+            right,
+            path,
             ..
-        } => left_origins.iter().chain(right_origins).cloned().collect(),
+        } => (
+            left_origins.as_slice(),
+            right_origins.as_slice(),
+            Some(left),
+            Some(right),
+            path.as_slice(),
+        ),
         FeatureFailureKind::Projection { origin, .. }
         | FeatureFailureKind::Remapping { origin, .. }
-        | FeatureFailureKind::InvalidOperation { origin, .. } => vec![origin.clone()],
+        | FeatureFailureKind::InvalidOperation { origin, .. } => {
+            (std::slice::from_ref(origin), &[][..], None, None, &[][..])
+        }
+    };
+    let belongs_left = left
+        .iter()
+        .any(|origin| tree_matches_derivation(tree, &origin.derivation_path));
+    let belongs_right = right
+        .iter()
+        .any(|origin| tree_matches_derivation(tree, &origin.derivation_path));
+    let conflict_site = tree_matches_conflict_site(tree, failure, conflict_path);
+    tree.conflict = match (belongs_left, belongs_right) {
+        (true, true) => ConflictSide::Both,
+        (true, false) => ConflictSide::Left,
+        (false, true) => ConflictSide::Right,
+        (false, false) => ConflictSide::None,
+    };
+    tree.top_source = tree
+        .top_provenance
+        .as_ref()
+        .map(|owner| source_for_path(&owner.derivation_path, left, right))
+        .unwrap_or(ConflictSide::None);
+    tree.bottom_source = tree
+        .bottom_provenance
+        .as_ref()
+        .map(|owner| source_for_path(&owner.derivation_path, left, right))
+        .unwrap_or(ConflictSide::None);
+    tree.top_conflict = false;
+    tree.bottom_conflict = false;
+    if conflict_site {
+        tree.top = left_value.cloned();
+        tree.bottom = right_value.cloned();
+        tree.top_conflict = left_value.is_some();
+        tree.bottom_conflict = right_value.is_some();
+    }
+    for child in &mut tree.children {
+        mark_conflicts(child, failure);
     }
 }
 
-fn mark_conflicts(tree: &mut AnnotatedTree, paths: &BTreeSet<Vec<usize>>) {
-    tree.conflict = paths.contains(&tree.provenance.derivation_path);
-    for child in &mut tree.children {
-        mark_conflicts(child, paths);
+fn source_for_path(
+    path: &[usize],
+    left: &[FeatureOrigin],
+    right: &[FeatureOrigin],
+) -> ConflictSide {
+    match (
+        left.iter().any(|origin| origin.derivation_path == path),
+        right.iter().any(|origin| origin.derivation_path == path),
+    ) {
+        (true, true) => ConflictSide::Both,
+        (true, false) => ConflictSide::Left,
+        (false, true) => ConflictSide::Right,
+        (false, false) => ConflictSide::None,
+    }
+}
+
+fn tree_matches_conflict_site(
+    tree: &AnnotatedTree,
+    failure: &FeatureFailure,
+    path: &[String],
+) -> bool {
+    let local_key = path
+        .first()
+        .filter(|key| key.starts_with('n') || key.as_str() == "foot")
+        .map(String::as_str)
+        .unwrap_or_else(|| failure.at.local_key.as_str());
+    if local_key.is_empty() {
+        return tree_matches_derivation(tree, &failure.at.derivation_path);
+    }
+    std::iter::once(&tree.provenance)
+        .chain(&tree.provenance_aliases)
+        .any(|provenance| {
+            provenance.derivation_path == failure.at.derivation_path
+                && normalize_local_key(&provenance.local_key) == normalize_local_key(local_key)
+        })
+}
+
+fn tree_matches_derivation(tree: &AnnotatedTree, path: &[usize]) -> bool {
+    tree.provenance.derivation_path == path
+        || tree
+            .provenance_aliases
+            .iter()
+            .any(|provenance| provenance.derivation_path == path)
+}
+
+fn normalize_local_key(key: &str) -> &str {
+    if key.starts_with('n') && (key.ends_with('t') || key.ends_with('b')) {
+        &key[..key.len() - 1]
+    } else {
+        key
     }
 }
 
@@ -838,7 +1044,13 @@ fn replace_foot(
     replacement: &AnnotatedTree,
 ) -> Result<(AnnotatedTree, usize), TagFoldError> {
     if tree.foot {
-        return Ok((replacement.clone(), 1));
+        let mut replacement = replacement.clone();
+        replacement.provenance_aliases.push(tree.provenance.clone());
+        if !tree.technical && tree.top.is_some() {
+            replacement.top = tree.top.clone();
+            replacement.top_provenance = tree.top_provenance.clone();
+        }
+        return Ok((replacement, 1));
     }
     let mut count = 0;
     let children = tree
@@ -876,7 +1088,7 @@ word 'john': noun
 
     const ADJUNCTION_TAG: &str = r#"
 tree base:
-  S[][] { V+ [] [] }
+  S[][] { S[][] { V+ [] [] } }
 
 tree adverb:
   S[][] {
@@ -928,7 +1140,8 @@ word 'john': noun
         assert_eq!(tree.label, "S");
         assert!(
             tree.top.is_none(),
-            "final elementary root hides its own top"
+            "final elementary root hides its own top: {:?}",
+            tree.top
         );
         assert_eq!(
             tree.bottom.as_ref().unwrap().to_string(),
@@ -1014,6 +1227,20 @@ word 'john': noun
             tree.children.iter().any(|child| child.label == "S"),
             "the host tree replaces the auxiliary foot"
         );
+        fn mixed_adjunction_boundary(tree: &AnnotatedTree) -> bool {
+            let mixed = tree
+                .top_provenance
+                .as_ref()
+                .zip(tree.bottom_provenance.as_ref())
+                .is_some_and(|(top, bottom)| {
+                    top.local_key == "foot" && top.derivation_path != bottom.derivation_path
+                });
+            mixed || tree.children.iter().any(mixed_adjunction_boundary)
+        }
+        assert!(
+            mixed_adjunction_boundary(&tree),
+            "the inserted host node should retain separate auxiliary-top and host-bottom provenance"
+        );
     }
 
     #[test]
@@ -1074,11 +1301,61 @@ word 'sleeps': sentence
         };
         assert!(path.ends_with(&["case".to_owned()]), "{path:?}");
         assert_ne!(left.to_string(), right.to_string());
+        assert!(left.to_string().starts_with('['));
+        assert!(right.to_string().starts_with('['));
+        assert!(left.to_string().contains("case:"));
+        assert!(right.to_string().contains("case:"));
         assert!(!left_origins.is_empty());
         assert!(!right_origins.is_empty());
+        fn conflicts(
+            tree: &AnnotatedTree,
+            sides: &mut Vec<ConflictSide>,
+            incompatible_nodes: &mut usize,
+        ) {
+            if tree.conflict != ConflictSide::None {
+                sides.push(tree.conflict);
+            }
+            if tree.conflict == ConflictSide::Both && tree.top.is_some() && tree.bottom.is_some() {
+                *incompatible_nodes += 1;
+            }
+            for child in &tree.children {
+                conflicts(child, sides, incompatible_nodes);
+            }
+        }
+        let mut sides = Vec::new();
+        let mut incompatible_nodes = 0;
+        conflicts(&diagnostic.tree, &mut sides, &mut incompatible_nodes);
+        assert!(!sides.is_empty());
         assert!(
-            diagnostic.tree.conflict || diagnostic.tree.children.iter().any(|node| node.conflict)
+            incompatible_nodes > 0,
+            "the conflict node should show incompatible top and bottom feature structures"
         );
+        assert!(
+            sides.contains(&ConflictSide::Both)
+                || (sides.contains(&ConflictSide::Left) && sides.contains(&ConflictSide::Right)),
+            "sides={sides:?}, left={left_origins:?}, right={right_origins:?}"
+        );
+
+        fn assert_ordinary_annotations(tree: &AnnotatedTree, is_final_root: bool) {
+            if tree.provenance.local_key.starts_with('n') {
+                assert!(
+                    tree.bottom.is_some(),
+                    "{} should retain its bottom FS after a descendant failure",
+                    tree.label
+                );
+                if !is_final_root {
+                    assert!(
+                        tree.top.is_some(),
+                        "{} should retain its top FS after a descendant failure",
+                        tree.label
+                    );
+                }
+            }
+            for child in &tree.children {
+                assert_ordinary_annotations(child, false);
+            }
+        }
+        assert_ordinary_annotations(&diagnostic.tree, true);
     }
 
     #[test]

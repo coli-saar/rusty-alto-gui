@@ -1,12 +1,12 @@
 use crate::model::{
-    ChartDocument, DerivationPresentation, FailurePresentation, FeatureStructureBox,
-    FeatureStructureLayout, FeatureStructureLine, FeatureStructureText, GrammarDocument,
-    HeuristicChoice, ParseOutcome, PresentationMode, RuleRow, StrategyChoice, TagPresentation,
-    TreeEdge, TreeLayout, TreeNode, ValuePresentation, ViewContent,
+    ChartDocument, ConflictHighlight, DerivationPresentation, FailurePresentation,
+    FeatureStructureBox, FeatureStructureLayout, FeatureStructureLine, FeatureStructureText,
+    GrammarDocument, HeuristicChoice, ParseOutcome, PresentationMode, RuleRow, StrategyChoice,
+    TagPresentation, TreeEdge, TreeLayout, TreeNode, ValuePresentation, ViewContent,
 };
 use crate::tag_folder::{
-    AnnotatedTree, FeatureFailure, FeatureFailureKind, FeatureOrigin, diagnose_tag_derivation,
-    fold_tag_derivation,
+    AnnotatedTree, ConflictSide, FeatureFailure, FeatureFailureKind, FeatureOrigin,
+    diagnose_tag_derivation, fold_tag_derivation,
 };
 use packed_term_arena::tree::{Tree, TreeArena};
 use rusty_alto::{
@@ -565,21 +565,33 @@ fn view_from_tree_filtered(
     }
 }
 
-fn conflict_derivation_paths(failure: &FeatureFailure) -> std::collections::BTreeSet<Vec<usize>> {
-    let origins: Vec<&FeatureOrigin> = match failure.kind.as_ref() {
+fn conflict_derivation_paths(
+    failure: &FeatureFailure,
+) -> std::collections::BTreeMap<Vec<usize>, ConflictHighlight> {
+    let (left, right): (Vec<&FeatureOrigin>, Vec<&FeatureOrigin>) = match failure.kind.as_ref() {
         FeatureFailureKind::Unification {
             left_origins,
             right_origins,
             ..
-        } => left_origins.iter().chain(right_origins).collect(),
+        } => (
+            left_origins.iter().collect(),
+            right_origins.iter().collect(),
+        ),
         FeatureFailureKind::Projection { origin, .. }
         | FeatureFailureKind::Remapping { origin, .. }
-        | FeatureFailureKind::InvalidOperation { origin, .. } => vec![origin],
+        | FeatureFailureKind::InvalidOperation { origin, .. } => (vec![origin], Vec::new()),
     };
-    origins
-        .into_iter()
-        .map(|origin| origin.derivation_path.clone())
-        .collect()
+    let mut result = std::collections::BTreeMap::new();
+    for origin in left {
+        result.insert(origin.derivation_path.clone(), ConflictHighlight::Left);
+    }
+    for origin in right {
+        result
+            .entry(origin.derivation_path.clone())
+            .and_modify(|side| *side = ConflictHighlight::Both)
+            .or_insert(ConflictHighlight::Right);
+    }
+    result
 }
 
 fn failure_presentation(failure: &FeatureFailure) -> FailurePresentation {
@@ -669,7 +681,11 @@ struct DisplayTree {
     top: Option<String>,
     bottom: Option<String>,
     muted: bool,
-    conflict: bool,
+    conflict: ConflictHighlight,
+    top_source: ConflictHighlight,
+    bottom_source: ConflictHighlight,
+    top_conflict: bool,
+    bottom_conflict: bool,
     children: Vec<DisplayTree>,
 }
 
@@ -685,7 +701,26 @@ fn layout_annotated_tree(tree: &AnnotatedTree) -> TreeLayout {
             top: tree.top.as_ref().map(format_feature_structure_compact),
             bottom: tree.bottom.as_ref().map(format_feature_structure_compact),
             muted: false,
-            conflict: tree.conflict,
+            conflict: match tree.conflict {
+                ConflictSide::None => ConflictHighlight::None,
+                ConflictSide::Left => ConflictHighlight::Left,
+                ConflictSide::Right => ConflictHighlight::Right,
+                ConflictSide::Both => ConflictHighlight::Both,
+            },
+            top_source: match tree.top_source {
+                ConflictSide::None => ConflictHighlight::None,
+                ConflictSide::Left => ConflictHighlight::Left,
+                ConflictSide::Right => ConflictHighlight::Right,
+                ConflictSide::Both => ConflictHighlight::Both,
+            },
+            bottom_source: match tree.bottom_source {
+                ConflictSide::None => ConflictHighlight::None,
+                ConflictSide::Left => ConflictHighlight::Left,
+                ConflictSide::Right => ConflictHighlight::Right,
+                ConflictSide::Both => ConflictHighlight::Both,
+            },
+            top_conflict: tree.top_conflict,
+            bottom_conflict: tree.bottom_conflict,
             children: tree.children.iter().map(convert).collect(),
         }
     }
@@ -765,13 +800,13 @@ fn format_feature_structure_compact(value: &FeatureStructure) -> String {
 fn layout_derivation_tree(
     tree: &TreeValue,
     show_technical: bool,
-    conflict_paths: &std::collections::BTreeSet<Vec<usize>>,
+    conflict_paths: &std::collections::BTreeMap<Vec<usize>, ConflictHighlight>,
 ) -> TreeLayout {
     fn convert(
         tree: &TreeValue,
         node: Tree,
         show_technical: bool,
-        conflict_paths: &std::collections::BTreeSet<Vec<usize>>,
+        conflict_paths: &std::collections::BTreeMap<Vec<usize>, ConflictHighlight>,
         path: &mut Vec<usize>,
     ) -> Vec<DisplayTree> {
         let arena = tree.arena();
@@ -796,7 +831,11 @@ fn layout_derivation_tree(
                 top: None,
                 bottom: None,
                 muted: technical,
-                conflict: conflict_paths.contains(path),
+                conflict: conflict_paths.get(path).copied().unwrap_or_default(),
+                top_source: ConflictHighlight::None,
+                bottom_source: ConflictHighlight::None,
+                top_conflict: false,
+                bottom_conflict: false,
                 children,
             }]
         }
@@ -817,7 +856,11 @@ fn layout_derivation_tree(
             top: None,
             bottom: None,
             muted: false,
-            conflict: false,
+            conflict: ConflictHighlight::None,
+            top_source: ConflictHighlight::None,
+            bottom_source: ConflictHighlight::None,
+            top_conflict: false,
+            bottom_conflict: false,
             children: roots,
         })
     }
@@ -860,6 +903,10 @@ fn layout_display_tree(tree: &DisplayTree) -> TreeLayout {
                     bottom: tree.bottom.clone(),
                     muted: tree.muted,
                     conflict: tree.conflict,
+                    top_source: tree.top_source,
+                    bottom_source: tree.bottom_source,
+                    top_conflict: tree.top_conflict,
+                    bottom_conflict: tree.bottom_conflict,
                     x: node_width / 2.0,
                     y: 0.0,
                     width: node_width,
@@ -932,6 +979,10 @@ fn layout_display_tree(tree: &DisplayTree) -> TreeLayout {
             bottom: tree.bottom.clone(),
             muted: tree.muted,
             conflict: tree.conflict,
+            top_source: tree.top_source,
+            bottom_source: tree.bottom_source,
+            top_conflict: tree.top_conflict,
+            bottom_conflict: tree.bottom_conflict,
             x: root_x,
             y: 0.0,
             width: node_width,
@@ -1002,7 +1053,11 @@ where
                     top: None,
                     bottom: None,
                     muted: false,
-                    conflict: false,
+                    conflict: ConflictHighlight::None,
+                    top_source: ConflictHighlight::None,
+                    bottom_source: ConflictHighlight::None,
+                    top_conflict: false,
+                    bottom_conflict: false,
                     x: node_width / 2.0,
                     y: 0.0,
                     width: node_width,
@@ -1075,7 +1130,11 @@ where
             top: None,
             bottom: None,
             muted: false,
-            conflict: false,
+            conflict: ConflictHighlight::None,
+            top_source: ConflictHighlight::None,
+            bottom_source: ConflictHighlight::None,
+            top_conflict: false,
+            bottom_conflict: false,
             x: root_x,
             y: 0.0,
             width: node_width,
@@ -1991,11 +2050,57 @@ word 'john': noun
         let ValuePresentation::Tree(tree) = &tag.derived_tree.value else {
             panic!("expected rejected derived tree");
         };
-        assert!(tree.nodes.iter().any(|node| node.conflict));
+        assert!(
+            tree.nodes
+                .iter()
+                .any(|node| node.conflict != ConflictHighlight::None)
+        );
+        assert!(
+            tree.nodes
+                .iter()
+                .any(|node| node.conflict == ConflictHighlight::Both
+                    && node.top.is_some()
+                    && node.bottom.is_some()),
+            "the composition node should show incompatible top and bottom feature structures"
+        );
+        assert!(
+            tree.nodes
+                .iter()
+                .filter(|node| node.conflict == ConflictHighlight::Left)
+                .count()
+                > 1,
+            "all nodes from the first elementary tree should share its color"
+        );
+        assert!(
+            tree.nodes
+                .iter()
+                .filter(|node| node.conflict == ConflictHighlight::Right)
+                .count()
+                > 1,
+            "all nodes from the second elementary tree should share its color"
+        );
+        assert!(
+            tree.nodes
+                .iter()
+                .any(|node| node.conflict == ConflictHighlight::Both)
+                || (tree
+                    .nodes
+                    .iter()
+                    .any(|node| node.conflict == ConflictHighlight::Left)
+                    && tree
+                        .nodes
+                        .iter()
+                        .any(|node| node.conflict == ConflictHighlight::Right))
+        );
         let ValuePresentation::Tree(derivation) = &tag.derivation.value else {
             panic!("expected rejected derivation tree");
         };
-        assert!(derivation.nodes.iter().any(|node| node.conflict));
+        assert!(
+            derivation
+                .nodes
+                .iter()
+                .any(|node| node.conflict != ConflictHighlight::None)
+        );
 
         let raw_outcome = parse_controlled(
             load_grammar(directory.join("rejected.tag"))
@@ -2109,5 +2214,117 @@ word 'sleeps': sentence
                 .any(|rule| rule.parent.contains("_S") && rule.parent.contains('['))
         );
         assert!(chart.rules.iter().all(|rule| !rule.parent.starts_with('q')));
+    }
+
+    #[test]
+    fn shieber_failure_attributes_technical_halves_to_their_elementary_tree() {
+        let directory =
+            std::env::temp_dir().join(format!("rusty_alto_gui_halves_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("shieber.tag");
+        std::fs::write(&path, SHIEBER_TAG).unwrap();
+        let grammar = load_grammar(path).unwrap().grammar;
+        let outcome = parse_controlled(
+            grammar.clone(),
+            vec![(
+                "string".into(),
+                "mer es huus es huus hälfed aastriiche".into(),
+            )],
+            vec!["ft".into()],
+            ParseOptions {
+                strategy: StrategyChoice::TopDown,
+                heuristic: HeuristicChoice::Zero,
+                stop_at_first_goal: false,
+                diagnose_feature_rejections: true,
+            },
+            ParseControl::new(),
+        )
+        .unwrap();
+        assert!(outcome.rejected_by_features);
+        let mut language = outcome.chart.automaton.sorted_language();
+        let weighted = language.next().unwrap();
+        let (arena, root) = language.clone_tree(weighted.tree());
+        let diagnostic = diagnose_tag_derivation(&grammar, &arena, root).unwrap();
+        fn collect<'a>(tree: &'a AnnotatedTree, nodes: &mut Vec<&'a AnnotatedTree>) {
+            nodes.push(tree);
+            for child in &tree.children {
+                collect(child, nodes);
+            }
+        }
+        let mut nodes = Vec::new();
+        collect(&diagnostic.tree, &mut nodes);
+
+        let auxiliary_s = nodes
+            .iter()
+            .filter(|node| node.label == "S" && node.provenance.derivation_path == [2])
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(auxiliary_s.len(), 3);
+        assert!(
+            auxiliary_s.iter().all(|node| {
+                node.top
+                    .as_ref()
+                    .is_none_or(|_| node.top_source == ConflictSide::Left)
+                    && node
+                        .bottom
+                        .as_ref()
+                        .is_none_or(|_| node.bottom_source == ConflictSide::Left)
+            }),
+            "{auxiliary_s:#?}"
+        );
+
+        let embedded_huus_n = nodes
+            .iter()
+            .find(|node| node.label == "n" && node.provenance.derivation_path == [2, 0])
+            .unwrap();
+        assert_eq!(embedded_huus_n.top_source, ConflictSide::Right);
+        assert_eq!(embedded_huus_n.bottom_source, ConflictSide::Right);
+
+        let embedded_huus_np = nodes
+            .iter()
+            .find(|node| node.label == "np" && node.provenance.derivation_path == [2, 0])
+            .unwrap();
+        assert!(
+            embedded_huus_np.top.is_some(),
+            "the real adjunction foot should materialize the auxiliary interface FS"
+        );
+        assert_eq!(
+            embedded_huus_np
+                .top_provenance
+                .as_ref()
+                .unwrap()
+                .derivation_path,
+            vec![2, 0, 1]
+        );
+        assert_eq!(
+            embedded_huus_np
+                .bottom_provenance
+                .as_ref()
+                .unwrap()
+                .derivation_path,
+            vec![2, 0]
+        );
+
+        let es_auxiliary_root = nodes
+            .iter()
+            .find(|node| {
+                node.label == "np"
+                    && node.provenance.derivation_path == [2, 0, 1]
+                    && node.top_conflict
+                    && node.bottom_conflict
+            })
+            .unwrap();
+        assert_eq!(es_auxiliary_root.top_source, ConflictSide::Left);
+        assert_eq!(
+            es_auxiliary_root.bottom_source,
+            ConflictSide::None,
+            "the auxiliary root's lower half remains owned by es, not huus"
+        );
+        assert_eq!(
+            embedded_huus_np.top_source,
+            ConflictSide::None,
+            "the foot/root interface remains owned by es on its upper half"
+        );
+        assert_eq!(embedded_huus_np.bottom_source, ConflictSide::Right);
     }
 }

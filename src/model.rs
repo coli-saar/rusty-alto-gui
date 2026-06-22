@@ -194,11 +194,24 @@ pub struct TreeNode {
     pub top: Option<String>,
     pub bottom: Option<String>,
     pub muted: bool,
-    pub conflict: bool,
+    pub conflict: ConflictHighlight,
+    pub top_source: ConflictHighlight,
+    pub bottom_source: ConflictHighlight,
+    pub top_conflict: bool,
+    pub bottom_conflict: bool,
     pub x: f32,
     pub y: f32,
     pub width: f32,
     pub height: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConflictHighlight {
+    #[default]
+    None,
+    Left,
+    Right,
+    Both,
 }
 
 #[derive(Debug, Clone)]

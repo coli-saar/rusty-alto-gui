@@ -980,14 +980,13 @@ fn sidebar(state: &Workbench) -> Element<'_, Message> {
         .push(grammar_row);
     for parse in &state.parses {
         let id = parse.id;
+        let title = parse_document_title(parse);
+        let title = text(title)
+            .size(12)
+            .wrapping(text::Wrapping::None)
+            .font_maybe(parse.rejected_by_features.then(rejected_parse_font));
         let content = column![
-            container(
-                text(format!("#{}  {}", parse.id, parse.label))
-                    .size(12)
-                    .wrapping(text::Wrapping::None),
-            )
-            .clip(true)
-            .width(Length::Fill),
+            container(title).clip(true).width(Length::Fill),
             text(if parse.rejected_by_features {
                 "Rejected by feature constraints".into()
             } else {
@@ -1161,7 +1160,7 @@ fn workspace(state: &Workbench) -> Element<'_, Message> {
                 DocumentTab::Primary => chart_page(parse),
                 DocumentTab::Language => language_page(
                     &parse.language,
-                    format!("#{}  {}", parse.id, parse.label),
+                    parse_document_title(parse),
                     "Chart",
                     if parse.rejected_by_features {
                         "Failures"
@@ -1215,14 +1214,15 @@ fn grammar_page(state: &Workbench) -> Element<'_, Message> {
 fn chart_page(parse: &ParseSession) -> Element<'_, Message> {
     let id = parse.id;
     let mut content = column![
-        page_heading(
-            format!("#{}  {}", parse.id, parse.label),
+        page_heading_styled(
+            parse_document_title(parse),
             format!(
                 "{} chart rules · {} states · built in {:.2?}",
                 parse.chart.summary.rule_count,
                 parse.chart.summary.state_count,
                 parse.chart.elapsed
             ),
+            parse.rejected_by_features,
         ),
         view_bar(
             "Chart",
@@ -1550,7 +1550,9 @@ fn language_page<'a>(
                     .into()
             };
             if rejected_by_features
-                && let Some(failure) = tag_presentation.and_then(|tag| tag.failure.as_ref())
+                && let Some(failure) = tag_presentation
+                    .and_then(|tag| tag.failure.as_ref())
+                    .filter(|failure| failure.right.is_empty())
             {
                 body = if wide_inspector {
                     row![body, failure_inspector(failure).width(Length::Fixed(360.0)),]
@@ -1660,9 +1662,12 @@ fn language_page<'a>(
         }
     };
 
-    let mut heading = row![page_heading(title, subtitle), space::horizontal()]
-        .align_y(Alignment::Center)
-        .spacing(5);
+    let mut heading = row![
+        page_heading_styled(title, subtitle, options.rejected_by_features),
+        space::horizontal()
+    ]
+    .align_y(Alignment::Center)
+    .spacing(5);
     if let Some(nav) = nav {
         heading = heading.push(nav);
     }
@@ -1992,12 +1997,39 @@ fn page<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
 }
 
 fn page_heading<'a>(title: impl Into<String>, subtitle: impl Into<String>) -> Element<'a, Message> {
+    page_heading_styled(title, subtitle, false)
+}
+
+fn page_heading_styled<'a>(
+    title: impl Into<String>,
+    subtitle: impl Into<String>,
+    rejected: bool,
+) -> Element<'a, Message> {
     column![
-        text(title.into()).size(19),
+        text(title.into())
+            .size(19)
+            .font_maybe(rejected.then(rejected_parse_font)),
         text(subtitle.into()).size(12).color(theme::MUTED),
     ]
     .spacing(3)
     .into()
+}
+
+fn rejected_parse_font() -> iced::Font {
+    iced::Font {
+        family: iced::font::Family::Name("Inter"),
+        weight: iced::font::Weight::Medium,
+        style: iced::font::Style::Italic,
+        ..iced::Font::DEFAULT
+    }
+}
+
+fn parse_document_title(parse: &ParseSession) -> String {
+    parse_document_title_parts(parse.id, &parse.label, parse.rejected_by_features)
+}
+
+fn parse_document_title_parts(id: u64, label: &str, rejected: bool) -> String {
+    format!("{}#{}  {}", if rejected { "*" } else { "" }, id, label)
 }
 
 fn empty_state<'a>(
@@ -2190,6 +2222,18 @@ mod tests {
         assert_eq!(
             parse_label(&inputs, &["ft".into()]),
             "john watches · hans betrachtet · ft defined"
+        );
+    }
+
+    #[test]
+    fn rejected_parse_titles_are_visibly_marked() {
+        assert_eq!(
+            parse_document_title_parts(1, "john sleeps", true),
+            "*#1  john sleeps"
+        );
+        assert_eq!(
+            parse_document_title_parts(1, "john sleeps", false),
+            "#1  john sleeps"
         );
     }
 
