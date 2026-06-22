@@ -48,7 +48,7 @@ drag = "2.1.1"
 muda = "0.15"
 # AppKit doesn't auto-track winit's windows in the Window menu, so we add them
 # ourselves via NSApplication.addWindowsItem. (objc2 versions match muda's.)
-objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSWindow", "NSResponder", "NSMenu"] }
+objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSWindow", "NSResponder", "NSMenu", "NSMenuItem"] }
 objc2-foundation = { version = "0.2.2", features = ["NSArray", "NSString"] }
 
 [profile.release]

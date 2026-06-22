@@ -113,6 +113,97 @@ pub fn update_view_mode(
             irtg.set_checked(grammar_loaded && irtg_selected);
         }
     });
+    suppress_window_tabbing();
+}
+
+/// Suppress macOS's automatic window-tabbing UI.
+///
+/// macOS enables automatic window tabbing by default, which injects "Show/Hide
+/// Tab Bar" and "Show All Tabs" into the View menu. We never use tabs, so this
+/// turns the feature off at its source and also strips any tab items AppKit may
+/// have already inserted. It's called from the same hooks that keep the rest of
+/// the menu in sync, since AppKit adds those items lazily.
+pub fn suppress_window_tabbing() {
+    use objc2_app_kit::{NSApplication, NSWindow};
+    use objc2_foundation::MainThreadMarker;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+
+    // Root cause: stop new windows from offering automatic tabbing.
+    NSWindow::setAllowsAutomaticWindowTabbing(false, mtm);
+
+    // Also remove any tab items already inserted into a menu before this ran.
+    let app = NSApplication::sharedApplication(mtm);
+    let Some(main_menu) = (unsafe { app.mainMenu() }) else {
+        return;
+    };
+
+    let top_count = unsafe { main_menu.numberOfItems() };
+    for top in 0..top_count {
+        let Some(submenu) = (unsafe { main_menu.itemAtIndex(top) })
+            .and_then(|item| unsafe { item.submenu() })
+        else {
+            continue;
+        };
+
+        let mut removed = false;
+        // Walk back-to-front so removals don't shift the indices still to visit.
+        let mut index = unsafe { submenu.numberOfItems() } - 1;
+        while index >= 0 {
+            if let Some(item) = unsafe { submenu.itemAtIndex(index) }
+                && let Some(action) = unsafe { item.action() }
+                && matches!(action.name(), "toggleTabBar:" | "toggleTabOverview:")
+            {
+                unsafe { submenu.removeItem(&item) };
+                removed = true;
+            }
+            index -= 1;
+        }
+
+        // Drop separators left dangling at the menu's edges once items are gone.
+        if removed {
+            trim_edge_separators(&submenu);
+        }
+    }
+}
+
+/// Remove separator items stranded at the very top or bottom of `submenu`.
+///
+/// `itemAtIndex:` raises on an out-of-range index, so each step re-reads the
+/// count and bails when the menu is empty.
+fn trim_edge_separators(submenu: &objc2_app_kit::NSMenu) {
+    // Trailing.
+    loop {
+        let count = unsafe { submenu.numberOfItems() };
+        if count == 0 {
+            break;
+        }
+        let Some(item) = (unsafe { submenu.itemAtIndex(count - 1) }) else {
+            break;
+        };
+        if unsafe { item.isSeparatorItem() } {
+            unsafe { submenu.removeItem(&item) };
+        } else {
+            break;
+        }
+    }
+    // Leading.
+    loop {
+        let count = unsafe { submenu.numberOfItems() };
+        if count == 0 {
+            break;
+        }
+        let Some(item) = (unsafe { submenu.itemAtIndex(0) }) else {
+            break;
+        };
+        if unsafe { item.isSeparatorItem() } {
+            unsafe { submenu.removeItem(&item) };
+        } else {
+            break;
+        }
+    }
 }
 
 pub fn refresh_windows_menu() {
@@ -140,4 +231,6 @@ pub fn refresh_windows_menu() {
         let title = window.title();
         unsafe { app.addWindowsItem_title_filename(&window, &title, false) };
     }
+
+    suppress_window_tabbing();
 }
