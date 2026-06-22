@@ -1,8 +1,10 @@
 use crate::model::{
     ChartDocument, DerivationPresentation, FeatureStructureBox, FeatureStructureLayout,
-    FeatureStructureLine, FeatureStructureText, GrammarDocument, HeuristicChoice, RuleRow,
-    StrategyChoice, TreeEdge, TreeLayout, TreeNode, ValuePresentation, ViewContent,
+    FeatureStructureLine, FeatureStructureText, GrammarDocument, HeuristicChoice, PresentationMode,
+    RuleRow, StrategyChoice, TagPresentation, TreeEdge, TreeLayout, TreeNode, ValuePresentation,
+    ViewContent,
 };
+use crate::tag_folder::{AnnotatedTree, fold_tag_derivation};
 use packed_term_arena::tree::{Tree, TreeArena};
 use rusty_alto::{
     AstarHeuristic, AstarOptions, Explicit, FeatureStructure, FeatureStructureNode,
@@ -52,6 +54,12 @@ pub fn load_grammar(path: PathBuf) -> Result<GrammarDocument, String> {
     let codec = registry
         .codec_for_path::<Irtg>(&path)
         .map_err(|error| error.to_string())?;
+    let source_codec = codec.metadata().name.to_owned();
+    let detected_mode = if source_codec == "tulipac" {
+        PresentationMode::Tag
+    } else {
+        PresentationMode::RawIrtg
+    };
     let grammar = Arc::new(codec.read_path(&path).map_err(|error| error.to_string())?);
     let summary = grammar.grammar().application_summary();
     let interpretations = grammar.interpretation_info();
@@ -66,6 +74,7 @@ pub fn load_grammar(path: PathBuf) -> Result<GrammarDocument, String> {
         .collect();
     Ok(GrammarDocument {
         path,
+        detected_mode,
         grammar,
         summary,
         interpretations,
@@ -369,6 +378,7 @@ fn prepare_and_run_language(
                             ViewContent {
                                 term: Some(term),
                                 name,
+                                warning: None,
                                 value,
                                 evaluated: Some(Arc::new(evaluated)),
                                 codecs,
@@ -378,10 +388,41 @@ fn prepare_and_run_language(
                 };
                 views.push(view);
             }
+            let (folded_derived, fold_warning) = match fold_tag_derivation(grammar, &arena, root) {
+                Ok(tree) => (
+                    Some(ViewContent {
+                        name: "Derived tree".into(),
+                        value: ValuePresentation::Tree(Arc::new(layout_annotated_tree(&tree))),
+                        ..Default::default()
+                    }),
+                    None,
+                ),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            let derived_tree = folded_derived.or_else(|| {
+                views
+                    .iter()
+                    .find(|view| view.name == "tree")
+                    .cloned()
+                    .map(|mut view| {
+                        view.name = "Derived tree".into();
+                        view.term = None;
+                        view.warning = fold_warning.map(|warning| {
+                            format!("Feature annotations are unavailable: {warning}")
+                        });
+                        view
+                    })
+            });
+            let tag = derived_tree.map(|derived_tree| TagPresentation {
+                derived_tree,
+                derivation: view_from_tree_filtered("Derivation", &derivation, false),
+                derivation_with_technical: view_from_tree_filtered("Derivation", &derivation, true),
+            });
             cache.push(Arc::new(DerivationPresentation {
                 index: cache.len(),
                 weight: weighted.weight(),
                 views,
+                tag,
             }));
         }
         if let Some(item) = cache.get(requested)
@@ -401,6 +442,7 @@ fn interpretation_error_view(
 ) -> ViewContent {
     ViewContent {
         name,
+        warning: None,
         term,
         value: ValuePresentation::Error(error),
         evaluated: None,
@@ -411,8 +453,24 @@ fn interpretation_error_view(
 fn view_from_tree(name: impl Into<String>, tree: &TreeValue) -> ViewContent {
     ViewContent {
         name: name.into(),
+        warning: None,
         term: None,
         value: ValuePresentation::Tree(Arc::new(layout_tree(tree))),
+        evaluated: None,
+        codecs: Vec::new(),
+    }
+}
+
+fn view_from_tree_filtered(
+    name: impl Into<String>,
+    tree: &TreeValue,
+    show_technical: bool,
+) -> ViewContent {
+    ViewContent {
+        name: name.into(),
+        warning: None,
+        term: None,
+        value: ValuePresentation::Tree(Arc::new(layout_derivation_tree(tree, show_technical))),
         evaluated: None,
         codecs: Vec::new(),
     }
@@ -422,6 +480,283 @@ const TREE_H_GAP: f32 = 28.0;
 const TREE_V_GAP: f32 = 74.0;
 const TREE_NODE_HEIGHT: f32 = 30.0;
 const TREE_MARGIN: f32 = 28.0;
+
+#[derive(Clone)]
+struct DisplayTree {
+    label: String,
+    top: Option<String>,
+    bottom: Option<String>,
+    muted: bool,
+    children: Vec<DisplayTree>,
+}
+
+fn layout_annotated_tree(tree: &AnnotatedTree) -> TreeLayout {
+    fn convert(tree: &AnnotatedTree) -> DisplayTree {
+        debug_assert!(
+            tree.provenance.local_key.is_empty()
+                || tree.provenance.local_key == "foot"
+                || tree.provenance.local_key.starts_with('n')
+        );
+        DisplayTree {
+            label: tree.label.clone(),
+            top: tree.top.as_ref().map(format_feature_structure_compact),
+            bottom: tree.bottom.as_ref().map(format_feature_structure_compact),
+            muted: false,
+            children: tree.children.iter().map(convert).collect(),
+        }
+    }
+    layout_display_tree(&convert(tree))
+}
+
+fn format_feature_structure_compact(value: &FeatureStructure) -> String {
+    fn count_incoming(
+        value: &FeatureStructure,
+        node: FeatureStructureNodeId,
+        incoming: &mut HashMap<FeatureStructureNodeId, usize>,
+        visited: &mut HashSet<FeatureStructureNodeId>,
+    ) {
+        if !visited.insert(node) {
+            return;
+        }
+        if let Some(attributes) = value.attributes(node) {
+            for attribute in attributes {
+                *incoming.entry(attribute.value).or_default() += 1;
+                count_incoming(value, attribute.value, incoming, visited);
+            }
+        }
+    }
+
+    fn render(
+        value: &FeatureStructure,
+        node: FeatureStructureNodeId,
+        markers: &HashMap<FeatureStructureNodeId, usize>,
+        expanded: &mut HashSet<FeatureStructureNodeId>,
+    ) -> String {
+        let marker = markers.get(&node).copied();
+        if let Some(marker) = marker
+            && !expanded.insert(node)
+        {
+            return format!("#{marker}");
+        }
+        let prefix = marker.map_or_else(String::new, |number| format!("#{number} "));
+        let body = match value.node(node) {
+            Some(FeatureStructureNode::Variable) => "[]".into(),
+            Some(FeatureStructureNode::Atom(atom)) => atom.to_owned(),
+            Some(FeatureStructureNode::Map) => {
+                let fields = value
+                    .attributes(node)
+                    .into_iter()
+                    .flatten()
+                    .map(|attribute| {
+                        format!(
+                            "{}: {}",
+                            attribute.name,
+                            render(value, attribute.value, markers, expanded)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("[{fields}]")
+            }
+            None => "<?>".into(),
+        };
+        format!("{prefix}{body}")
+    }
+
+    let mut incoming = HashMap::new();
+    count_incoming(value, value.root(), &mut incoming, &mut HashSet::new());
+    let mut shared = incoming
+        .into_iter()
+        .filter_map(|(node, count)| (count > 1).then_some(node))
+        .collect::<Vec<_>>();
+    shared.sort_by_key(|node| format!("{node:?}"));
+    let markers = shared
+        .into_iter()
+        .enumerate()
+        .map(|(index, node)| (node, index + 1))
+        .collect::<HashMap<_, _>>();
+    render(value, value.root(), &markers, &mut HashSet::new())
+}
+
+fn layout_derivation_tree(tree: &TreeValue, show_technical: bool) -> TreeLayout {
+    fn convert(tree: &TreeValue, node: Tree, show_technical: bool) -> Vec<DisplayTree> {
+        let arena = tree.arena();
+        let label = arena.get_label(node);
+        let technical = label.starts_with("*NOP*");
+        let children = arena
+            .get_children(node)
+            .iter()
+            .flat_map(|&child| convert(tree, child, show_technical))
+            .collect::<Vec<_>>();
+        if technical && !show_technical {
+            children
+        } else {
+            vec![DisplayTree {
+                label: label.clone(),
+                top: None,
+                bottom: None,
+                muted: technical,
+                children,
+            }]
+        }
+    }
+
+    let mut roots = convert(tree, tree.root(), show_technical);
+    if roots.len() == 1 {
+        layout_display_tree(&roots.remove(0))
+    } else {
+        layout_display_tree(&DisplayTree {
+            label: "Derivation".into(),
+            top: None,
+            bottom: None,
+            muted: false,
+            children: roots,
+        })
+    }
+}
+
+fn layout_display_tree(tree: &DisplayTree) -> TreeLayout {
+    struct Subtree {
+        nodes: Vec<TreeNode>,
+        edges: Vec<TreeEdge>,
+        width: f32,
+        height: f32,
+        root_x: f32,
+        root_height: f32,
+        root_muted: bool,
+    }
+
+    fn node_dimensions(tree: &DisplayTree) -> (f32, f32) {
+        let longest = std::iter::once(tree.label.as_str())
+            .chain(tree.top.as_deref())
+            .chain(tree.bottom.as_deref())
+            .map(str::chars)
+            .map(Iterator::count)
+            .max()
+            .unwrap_or_default();
+        let lines = 1 + usize::from(tree.top.is_some()) + usize::from(tree.bottom.is_some());
+        (
+            (longest as f32 * 6.8 + 24.0).clamp(58.0, 360.0),
+            TREE_NODE_HEIGHT + (lines.saturating_sub(1) as f32 * 20.0),
+        )
+    }
+
+    fn visit(tree: &DisplayTree) -> Subtree {
+        let (node_width, node_height) = node_dimensions(tree);
+        let children = tree.children.iter().map(visit).collect::<Vec<_>>();
+        if children.is_empty() {
+            return Subtree {
+                nodes: vec![TreeNode {
+                    label: tree.label.clone(),
+                    top: tree.top.clone(),
+                    bottom: tree.bottom.clone(),
+                    muted: tree.muted,
+                    x: node_width / 2.0,
+                    y: 0.0,
+                    width: node_width,
+                    height: node_height,
+                }],
+                edges: Vec::new(),
+                width: node_width,
+                height: node_height,
+                root_x: node_width / 2.0,
+                root_height: node_height,
+                root_muted: tree.muted,
+            };
+        }
+
+        let children_width = children.iter().map(|child| child.width).sum::<f32>()
+            + TREE_H_GAP * children.len().saturating_sub(1) as f32;
+        let child_y = node_height + (TREE_V_GAP - TREE_NODE_HEIGHT);
+        let mut child_roots = Vec::with_capacity(children.len());
+        let mut child_meta = Vec::with_capacity(children.len());
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut cursor = 0.0;
+        let mut height: f32 = node_height;
+        for child in children {
+            child_roots.push(cursor + child.root_x);
+            child_meta.push((child.root_height, child.root_muted));
+            height = height.max(child_y + child.height);
+            nodes.extend(child.nodes.into_iter().map(|mut item| {
+                item.x += cursor;
+                item.y += child_y;
+                item
+            }));
+            edges.extend(child.edges.into_iter().map(|mut edge| {
+                edge.parent_x += cursor;
+                edge.child_x += cursor;
+                edge.parent_y += child_y;
+                edge.child_y += child_y;
+                edge
+            }));
+            cursor += child.width + TREE_H_GAP;
+        }
+
+        let root_x = (child_roots[0] + child_roots[child_roots.len() - 1]) / 2.0;
+        let left = (root_x - node_width / 2.0).min(0.0);
+        let right = (root_x + node_width / 2.0).max(children_width);
+        let shift_x = -left;
+        for item in &mut nodes {
+            item.x += shift_x;
+        }
+        for edge in &mut edges {
+            edge.parent_x += shift_x;
+            edge.child_x += shift_x;
+        }
+        for root in &mut child_roots {
+            *root += shift_x;
+        }
+        let root_x = root_x + shift_x;
+        for (index, child_x) in child_roots.into_iter().enumerate() {
+            edges.push(TreeEdge {
+                parent_x: root_x,
+                parent_y: node_height,
+                child_x,
+                child_y,
+                muted: tree.muted || child_meta[index].1,
+            });
+        }
+        nodes.push(TreeNode {
+            label: tree.label.clone(),
+            top: tree.top.clone(),
+            bottom: tree.bottom.clone(),
+            muted: tree.muted,
+            x: root_x,
+            y: 0.0,
+            width: node_width,
+            height: node_height,
+        });
+        Subtree {
+            nodes,
+            edges,
+            width: right - left,
+            height,
+            root_x,
+            root_height: node_height,
+            root_muted: tree.muted,
+        }
+    }
+
+    let subtree = visit(tree);
+    let mut layout = TreeLayout {
+        nodes: subtree.nodes,
+        edges: subtree.edges,
+        width: subtree.width + TREE_MARGIN * 2.0,
+        height: subtree.height + TREE_MARGIN * 2.0,
+    };
+    for node in &mut layout.nodes {
+        node.x += TREE_MARGIN;
+        node.y += TREE_MARGIN;
+    }
+    for edge in &mut layout.edges {
+        edge.parent_x += TREE_MARGIN;
+        edge.parent_y += TREE_MARGIN;
+        edge.child_x += TREE_MARGIN;
+        edge.child_y += TREE_MARGIN;
+    }
+    layout
+}
 
 /// Lay out any tree given accessors for a node's label and children. Used for
 /// derivation trees, tree-valued interpretations, and interpretation terms.
@@ -454,9 +789,13 @@ where
             return Subtree {
                 nodes: vec![TreeNode {
                     label,
+                    top: None,
+                    bottom: None,
+                    muted: false,
                     x: node_width / 2.0,
                     y: 0.0,
                     width: node_width,
+                    height: TREE_NODE_HEIGHT,
                 }],
                 edges: Vec::new(),
                 width: node_width,
@@ -517,13 +856,18 @@ where
                 parent_y: TREE_NODE_HEIGHT,
                 child_x,
                 child_y: TREE_V_GAP,
+                muted: false,
             });
         }
         nodes.push(TreeNode {
             label,
+            top: None,
+            bottom: None,
+            muted: false,
             x: root_x,
             y: 0.0,
             width: node_width,
+            height: TREE_NODE_HEIGHT,
         });
 
         Subtree {
@@ -1105,6 +1449,14 @@ VP -> sleeps
     }
 
     #[test]
+    fn compact_feature_annotations_preserve_reentrancies() {
+        let value = FeatureStructure::parse("[left: #x [case: nom], right: #x]").unwrap();
+        let rendered = format_feature_structure_compact(&value);
+        assert!(rendered.contains("#1 [case: nom]"), "{rendered}");
+        assert!(rendered.contains("right: #1"), "{rendered}");
+    }
+
+    #[test]
     fn tree_layout_bounds_cover_wide_asymmetric_subtrees() {
         let mut arena = TreeArena::<String>::new();
         let deep_leaf = arena.add_node("deep".into(), vec![]);
@@ -1241,6 +1593,68 @@ VP -> sleeps
             other => panic!("expected derivation after invalid interpretation, got {other:?}"),
         };
         assert_eq!(next.index, next_index);
+    }
+
+    #[test]
+    fn tag_presentation_contains_annotations_and_collapses_nops() {
+        let directory =
+            std::env::temp_dir().join(format!("rusty_alto_gui_tag_views_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("views.tag");
+        std::fs::write(
+            &path,
+            r#"
+tree sentence:
+  S @NA [][] {
+    NP! [case=nom][]
+    V+ [tense=pres][]
+  }
+
+tree noun:
+  NP @NA [][] { N+ @NA [case=nom][] }
+
+word 'sleeps': sentence
+word 'john': noun
+"#,
+        )
+        .unwrap();
+        let grammar = load_grammar(path).unwrap().grammar;
+        let (tx, rx) = mpsc::channel();
+        let worker = start_grammar_language_worker(grammar, tx);
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            LanguageEvent::Ready(_)
+        ));
+        worker.request(0);
+        let item = match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            LanguageEvent::Derivation(item) => item,
+            other => panic!("expected derivation, got {other:?}"),
+        };
+        let tag = item.tag.as_ref().unwrap();
+        let ValuePresentation::Tree(derived) = &tag.derived_tree.value else {
+            panic!("expected derived tree");
+        };
+        assert!(
+            derived
+                .nodes
+                .iter()
+                .any(|node| node.top.is_some() || node.bottom.is_some()),
+            "{:?}",
+            tag.derived_tree.warning
+        );
+        let ValuePresentation::Tree(collapsed) = &tag.derivation.value else {
+            panic!("expected collapsed derivation");
+        };
+        let ValuePresentation::Tree(technical) = &tag.derivation_with_technical.value else {
+            panic!("expected technical derivation");
+        };
+        assert!(collapsed.nodes.len() < technical.nodes.len());
+        assert!(
+            technical
+                .nodes
+                .iter()
+                .any(|node| node.muted && node.label.starts_with("*NOP*"))
+        );
     }
 
     #[test]

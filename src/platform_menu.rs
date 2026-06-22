@@ -1,13 +1,20 @@
 use muda::{
-    AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu,
+    AboutMetadata, CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu,
     accelerator::{Accelerator, Code, Modifiers},
 };
+use std::cell::RefCell;
 
 pub const OPEN_GRAMMAR_ID: &str = "open-grammar";
 pub const NEW_PARSE_ID: &str = "new-parse";
 pub const CLOSE_ALL_ID: &str = "close-all";
 pub const KEYBOARD_SHORTCUTS_ID: &str = "keyboard-shortcuts";
+pub const VIEW_TAG_ID: &str = "view-tag";
+pub const VIEW_IRTG_ID: &str = "view-irtg";
 const APP_NAME: &str = "Rusty Alto";
+
+thread_local! {
+    static VIEW_ITEMS: RefCell<Option<(CheckMenuItem, CheckMenuItem)>> = const { RefCell::new(None) };
+}
 
 fn cmd(code: Code) -> Accelerator {
     Accelerator::new(Some(Modifiers::SUPER), code)
@@ -62,6 +69,14 @@ pub fn install() {
         &close_all,
     ]);
 
+    let view_menu = Submenu::new("View", true);
+    let tag = CheckMenuItem::with_id(VIEW_TAG_ID, "TAG", false, false, None);
+    let irtg = CheckMenuItem::with_id(VIEW_IRTG_ID, "IRTG", false, false, None);
+    let _ = view_menu.append_items(&[&tag, &irtg]);
+    VIEW_ITEMS.with(|items| {
+        *items.borrow_mut() = Some((tag, irtg));
+    });
+
     let window_menu = Submenu::new("Window", true);
     let _ = window_menu.append_items(&[
         &PredefinedMenuItem::minimize(None),
@@ -79,9 +94,25 @@ pub fn install() {
     );
     let _ = help_menu.append(&shortcuts);
 
-    let _ = menu.append_items(&[&app_menu, &file_menu, &window_menu, &help_menu]);
+    let _ = menu.append_items(&[&app_menu, &file_menu, &view_menu, &window_menu, &help_menu]);
     menu.init_for_nsapp();
     std::mem::forget(menu);
+}
+
+pub fn update_view_mode(
+    grammar_loaded: bool,
+    tag_available: bool,
+    tag_selected: bool,
+    irtg_selected: bool,
+) {
+    VIEW_ITEMS.with(|items| {
+        if let Some((tag, irtg)) = items.borrow().as_ref() {
+            tag.set_enabled(tag_available);
+            irtg.set_enabled(grammar_loaded);
+            tag.set_checked(tag_available && tag_selected);
+            irtg.set_checked(grammar_loaded && irtg_selected);
+        }
+    });
 }
 
 pub fn refresh_windows_menu() {

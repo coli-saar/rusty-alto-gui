@@ -4,8 +4,8 @@ use crate::{
     },
     feature_canvas::feature_structure_view,
     model::{
-        ChartDocument, DocumentTab, GrammarDocument, HeuristicChoice, InputField, RuleColumn,
-        RuleRow, StrategyChoice, ValuePresentation,
+        ChartDocument, DocumentTab, GrammarDocument, HeuristicChoice, InputField, PresentationMode,
+        RuleColumn, RuleRow, StrategyChoice, ValuePresentation, ViewContent,
     },
     theme,
     tree_canvas::tree_view,
@@ -180,6 +180,8 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
                 if let Some(window) = app.windows.get_mut(&target) {
                     window.apply_grammar(Ok(document));
                 }
+                #[cfg(target_os = "macos")]
+                sync_view_menu(app);
                 Task::none()
             }
             Err(error) if opened_new => {
@@ -208,6 +210,7 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
                     crate::platform_menu::install();
                 }
                 crate::platform_menu::refresh_windows_menu();
+                sync_view_menu(app);
             }
             window::gain_focus(id)
         }
@@ -228,6 +231,7 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
         #[cfg(target_os = "macos")]
         AppMsg::WindowFocused(id) => {
             app.focused = Some(id);
+            sync_view_menu(app);
             Task::none()
         }
         #[cfg(target_os = "macos")]
@@ -259,12 +263,57 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
                             tasks.push(app_update(app, AppMsg::Window(id, Message::ShowShortcuts)));
                         }
                     }
+                    crate::platform_menu::VIEW_TAG_ID => {
+                        if let Some(id) = app.focused.or_else(|| app.windows.keys().next().copied())
+                        {
+                            tasks.push(app_update(
+                                app,
+                                AppMsg::Window(
+                                    id,
+                                    Message::SetPresentationMode(PresentationMode::Tag),
+                                ),
+                            ));
+                            sync_view_menu(app);
+                        }
+                    }
+                    crate::platform_menu::VIEW_IRTG_ID => {
+                        if let Some(id) = app.focused.or_else(|| app.windows.keys().next().copied())
+                        {
+                            tasks.push(app_update(
+                                app,
+                                AppMsg::Window(
+                                    id,
+                                    Message::SetPresentationMode(PresentationMode::RawIrtg),
+                                ),
+                            ));
+                            sync_view_menu(app);
+                        }
+                    }
                     _ => {}
                 }
             }
             Task::batch(tasks)
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn sync_view_menu(app: &App) {
+    let state = app
+        .focused
+        .and_then(|id| app.windows.get(&id))
+        .or_else(|| app.windows.values().next());
+    let tag_available = state
+        .and_then(|state| state.grammar.as_ref())
+        .is_some_and(|grammar| grammar.detected_mode == PresentationMode::Tag);
+    let grammar_loaded = state.is_some_and(|state| state.grammar.is_some());
+    let mode = state.map(|state| state.presentation_mode);
+    crate::platform_menu::update_view_mode(
+        grammar_loaded,
+        tag_available,
+        mode == Some(PresentationMode::Tag),
+        mode == Some(PresentationMode::RawIrtg),
+    );
 }
 
 fn app_subscription(app: &App) -> Subscription<AppMsg> {
@@ -324,6 +373,8 @@ pub enum Message {
     StrategyChanged(StrategyChoice),
     HeuristicChanged(HeuristicChoice),
     StopAtFirstGoal(bool),
+    SetPresentationMode(PresentationMode),
+    ShowTechnicalNodes(bool),
     FocusNext,
     FocusPrevious,
     Parse,
@@ -388,7 +439,7 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
         }
         Message::NewParse => {
             if let Some(grammar) = &state.grammar {
-                state.inputs = input_fields(grammar);
+                state.inputs = input_fields(grammar, state.presentation_mode);
                 state.strategy = StrategyChoice::TopDown;
                 state.heuristic = HeuristicChoice::Zero;
                 state.stop_at_first_goal = false;
@@ -437,6 +488,30 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
         Message::StopAtFirstGoal(value) => {
             state.stop_at_first_goal = value && state.constraint_count() <= 1;
         }
+        Message::SetPresentationMode(mode) => {
+            let compatible = state.grammar.as_ref().is_some_and(|grammar| {
+                mode == PresentationMode::RawIrtg || grammar.detected_mode == PresentationMode::Tag
+            });
+            if compatible && state.presentation_mode != mode {
+                state.presentation_mode = mode;
+                state.show_technical_nodes = false;
+                if let Some(grammar) = &state.grammar {
+                    state.inputs = input_fields(grammar, mode);
+                }
+                if mode == PresentationMode::Tag {
+                    state.strategy = StrategyChoice::TopDown;
+                    state.heuristic = HeuristicChoice::Zero;
+                    state.stop_at_first_goal = false;
+                }
+                if let Some(language) = &mut state.grammar_language {
+                    language.output_index = 0;
+                }
+                for parse in &mut state.parses {
+                    parse.language.output_index = 0;
+                }
+            }
+        }
+        Message::ShowTechnicalNodes(value) => state.show_technical_nodes = value,
         Message::FocusNext => return iced::widget::operation::focus_next(),
         Message::FocusPrevious => return iced::widget::operation::focus_previous(),
         Message::Parse => {
@@ -462,13 +537,32 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
                 .filter(|input| input.require_valid && input.value.trim().is_empty())
                 .map(|input| input.name.clone())
                 .collect::<Vec<_>>();
+            let mut required_valid = required_valid;
+            if state.presentation_mode == PresentationMode::Tag
+                && state.grammar.as_ref().is_some_and(|grammar| {
+                    grammar
+                        .interpretations
+                        .iter()
+                        .any(|info| info.name == "ft" && info.non_null_filter_capable)
+                })
+            {
+                required_valid.push("ft".into());
+            }
+            if state.presentation_mode == PresentationMode::Tag && inputs.is_empty() {
+                state.fail("Enter a sentence to parse.".into());
+                return Task::none();
+            }
             if inputs.is_empty() && required_valid.is_empty() {
                 state.fail(
                     "Enter an interpretation input or require at least one valid value.".into(),
                 );
                 return Task::none();
             }
-            state.pending_label = Some(parse_label(&inputs, &required_valid));
+            state.pending_label = Some(if state.presentation_mode == PresentationMode::Tag {
+                parse_label(&inputs, &[])
+            } else {
+                parse_label(&inputs, &required_valid)
+            });
             state.error = None;
             let job_id = state.next_parse_job_id;
             state.next_parse_job_id += 1;
@@ -478,9 +572,16 @@ fn update(state: &mut Workbench, message: Message) -> Task<Message> {
                 started: Instant::now(),
                 control: control.clone(),
             });
-            let strategy = state.strategy;
-            let heuristic = state.heuristic;
-            let stop_at_first_goal = state.stop_at_first_goal && state.constraint_count() <= 1;
+            let (strategy, heuristic, stop_at_first_goal) =
+                if state.presentation_mode == PresentationMode::Tag {
+                    (StrategyChoice::TopDown, HeuristicChoice::Zero, false)
+                } else {
+                    (
+                        state.strategy,
+                        state.heuristic,
+                        state.stop_at_first_goal && state.constraint_count() <= 1,
+                    )
+                };
             return Task::perform(
                 async move {
                     tokio::task::spawn_blocking(move || {
@@ -1023,6 +1124,8 @@ fn workspace(state: &Workbench) -> Element<'_, Message> {
                             .map(|grammar| format!("Grammar: {}", display_name(&grammar.path)))
                             .unwrap_or_else(|| "Grammar".into()),
                         "Grammar",
+                        state.presentation_mode,
+                        state.show_technical_nodes,
                     )
                 })
                 .unwrap_or_else(|| empty_state("No language", "Open a grammar first.", None)),
@@ -1037,6 +1140,8 @@ fn workspace(state: &Workbench) -> Element<'_, Message> {
                     &parse.language,
                     format!("#{}  {}", parse.id, parse.label),
                     "Chart",
+                    state.presentation_mode,
+                    state.show_technical_nodes,
                 ),
             }
         }
@@ -1101,16 +1206,29 @@ fn parse_page(state: &Workbench) -> Element<'_, Message> {
     let mut fields = Column::new().spacing(10);
     for (index, input) in state.inputs.iter().enumerate() {
         let has_exact_input = !input.value.trim().is_empty();
-        let mut row = Column::new()
-            .spacing(5)
-            .push(text(&input.name).size(12).color(theme::MUTED));
+        let mut row = Column::new().spacing(5).push(
+            text(if state.presentation_mode == PresentationMode::Tag {
+                "Sentence"
+            } else {
+                &input.name
+            })
+            .size(12)
+            .color(theme::MUTED),
+        );
         if input.input_capable {
-            let mut field = text_input("Optional interpretation input", &input.value)
-                .id(input.id.clone())
-                .on_input(move |value| Message::InputChanged(index, value))
-                .on_paste(move |value| Message::InputChanged(index, value))
-                .padding(9)
-                .size(13);
+            let mut field = text_input(
+                if state.presentation_mode == PresentationMode::Tag {
+                    "Enter a sentence"
+                } else {
+                    "Optional interpretation input"
+                },
+                &input.value,
+            )
+            .id(input.id.clone())
+            .on_input(move |value| Message::InputChanged(index, value))
+            .on_paste(move |value| Message::InputChanged(index, value))
+            .padding(9)
+            .size(13);
             if state.busy.is_none() && state.active_parse.is_none() {
                 field = field.on_submit(Message::Parse);
             }
@@ -1186,31 +1304,40 @@ fn parse_page(state: &Workbench) -> Element<'_, Message> {
     } else {
         parse_button
     };
-    page(
-        column![
-            page_heading(
-                "Parse new input",
-                "Provide one or more interpretation values, then choose a chart construction strategy.",
-            ),
-            container(fields)
-                .padding(14)
-                .width(Length::Fill)
-                .style(theme::raised),
+    let mut content = column![
+        page_heading(
+            "Parse new input",
+            if state.presentation_mode == PresentationMode::Tag {
+                "Enter the sentence to parse."
+            } else {
+                "Provide one or more interpretation values, then choose a chart construction strategy."
+            },
+        ),
+        container(fields)
+            .padding(14)
+            .width(Length::Fill)
+            .style(theme::raised),
+    ]
+    .spacing(theme::SECTION_SPACING)
+    .max_width(760);
+    if state.presentation_mode != PresentationMode::Tag {
+        content = content.push(
             container(options)
                 .padding(14)
                 .width(Length::Fill)
                 .style(theme::raised),
-            row![space::horizontal(), parse_button],
-        ]
-        .spacing(theme::SECTION_SPACING)
-        .max_width(760),
-    )
+        );
+    }
+    content = content.push(row![space::horizontal(), parse_button]);
+    page(content)
 }
 
 fn language_page<'a>(
     language: &'a LanguageSession,
     title: String,
     primary_label: &'a str,
+    mode: PresentationMode,
+    show_technical_nodes: bool,
 ) -> Element<'a, Message> {
     let derivation = match &language.status {
         LanguageStatus::Ready(LanguageCardinality::Finite(0)) => None,
@@ -1261,10 +1388,26 @@ fn language_page<'a>(
             ),
         ),
         (LanguageStatus::Ready(_), Some(derivation)) => {
+            let tag_presentation = (mode == PresentationMode::Tag)
+                .then_some(derivation.tag.as_ref())
+                .flatten();
+            let tag_derivation: Option<&ViewContent> = tag_presentation.map(|tag| {
+                if show_technical_nodes {
+                    &tag.derivation_with_technical
+                } else {
+                    &tag.derivation
+                }
+            });
+            let visible_views: Vec<&ViewContent> =
+                if let (Some(tag), Some(tag_derivation)) = (tag_presentation, tag_derivation) {
+                    vec![&tag.derived_tree, tag_derivation]
+                } else {
+                    derivation.views.iter().collect()
+                };
             let output_index = language
                 .output_index
-                .min(derivation.views.len().saturating_sub(1));
-            let output = &derivation.views[output_index];
+                .min(visible_views.len().saturating_sub(1));
+            let output = visible_views[output_index];
             let value_is_structured = matches!(
                 output.value,
                 ValuePresentation::Tree(_) | ValuePresentation::FeatureStructure(_)
@@ -1289,6 +1432,19 @@ fn language_page<'a>(
                         output.codecs.clone(),
                     ))
                     .into()
+            } else {
+                value
+            };
+            let value: Element<'a, Message> = if let Some(warning) = &output.warning {
+                column![
+                    container(text(warning).size(11).color(theme::MUTED))
+                        .padding([7, 10])
+                        .width(Length::Fill),
+                    value,
+                ]
+                .spacing(4)
+                .height(Length::Fill)
+                .into()
             } else {
                 value
             };
@@ -1350,7 +1506,7 @@ fn language_page<'a>(
 
             // Interpretation-view tabs sit in the bar, right above the tree.
             let mut tabs = Row::new().spacing(4).align_y(Alignment::Center);
-            for (index, item) in derivation.views.iter().enumerate() {
+            for (index, item) in visible_views.iter().enumerate() {
                 tabs = tabs.push(
                     button(text(&item.name).size(12))
                         .padding([6, 12])
@@ -1360,6 +1516,14 @@ fn language_page<'a>(
                             theme::quiet_button
                         })
                         .on_press(Message::SelectOutput(index)),
+                );
+            }
+            if tag_presentation.is_some() && output_index == 1 {
+                tabs = tabs.push(
+                    checkbox(show_technical_nodes)
+                        .label("Show technical nodes")
+                        .size(13)
+                        .on_toggle(Message::ShowTechnicalNodes),
                 );
             }
             let zoom = row![
@@ -1762,7 +1926,10 @@ impl Workbench {
                 let (sender, receiver) = mpsc::channel();
                 let worker =
                     workers::start_grammar_language_worker(document.grammar.clone(), sender);
-                self.inputs = input_fields(&document);
+                self.presentation_mode = document.detected_mode;
+                self.show_technical_nodes = false;
+                self.inputs = input_fields(&document, self.presentation_mode);
+                self.strategy = StrategyChoice::TopDown;
                 self.grammar = Some(document);
                 self.grammar_language = Some(LanguageSession::preparing(worker, receiver));
                 self.parses.clear();
@@ -1826,10 +1993,11 @@ impl Workbench {
     }
 }
 
-fn input_fields(grammar: &GrammarDocument) -> Vec<InputField> {
+fn input_fields(grammar: &GrammarDocument, mode: PresentationMode) -> Vec<InputField> {
     grammar
         .interpretations
         .iter()
+        .filter(|info| mode != PresentationMode::Tag || info.name == "string")
         .map(|info| InputField {
             name: info.name.clone(),
             value: String::new(),
@@ -2121,7 +2289,7 @@ S! -> value
         )
         .unwrap();
         let document = workers::load_grammar(path).unwrap();
-        let rows = input_fields(&document);
+        let rows = input_fields(&document, PresentationMode::RawIrtg);
         assert_eq!(rows.len(), 3);
         let ft = rows.iter().find(|row| row.name == "ft").unwrap();
         let string = rows.iter().find(|row| row.name == "string").unwrap();
@@ -2130,6 +2298,39 @@ S! -> value
         assert!(!ft.require_valid);
         assert!(string.input_capable);
         assert!(!tree.input_capable);
+    }
+
+    #[test]
+    fn tag_mode_is_detected_and_can_switch_to_raw_irtg() {
+        let directory =
+            std::env::temp_dir().join(format!("rusty_alto_gui_tag_mode_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("mode.tag");
+        std::fs::write(
+            &path,
+            r#"
+tree sentence:
+  S @NA { V+ }
+word 'sleeps': sentence
+"#,
+        )
+        .unwrap();
+        let document = workers::load_grammar(path).unwrap();
+        assert_eq!(document.detected_mode, PresentationMode::Tag);
+
+        let mut state = Workbench::default();
+        state.apply_grammar(Ok(document));
+        assert_eq!(state.presentation_mode, PresentationMode::Tag);
+        assert_eq!(state.strategy, StrategyChoice::TopDown);
+        assert_eq!(state.inputs.len(), 1);
+        assert_eq!(state.inputs[0].name, "string");
+
+        let _ = update(
+            &mut state,
+            Message::SetPresentationMode(PresentationMode::RawIrtg),
+        );
+        assert_eq!(state.presentation_mode, PresentationMode::RawIrtg);
+        assert!(state.inputs.iter().any(|input| input.name == "tree"));
     }
 
     #[test]

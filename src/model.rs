@@ -11,6 +11,21 @@ pub enum DocumentTab {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentationMode {
+    RawIrtg,
+    Tag,
+}
+
+impl std::fmt::Display for PresentationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RawIrtg => "IRTG",
+            Self::Tag => "TAG",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleColumn {
     Rule,
     Weight,
@@ -85,6 +100,7 @@ pub struct InputField {
 #[derive(Clone)]
 pub struct GrammarDocument {
     pub path: PathBuf,
+    pub detected_mode: PresentationMode,
     pub grammar: Arc<Irtg>,
     pub summary: AutomatonSummary,
     pub interpretations: Vec<InterpretationInfo>,
@@ -175,9 +191,13 @@ pub struct TreeLayout {
 #[derive(Debug, Clone)]
 pub struct TreeNode {
     pub label: String,
+    pub top: Option<String>,
+    pub bottom: Option<String>,
+    pub muted: bool,
     pub x: f32,
     pub y: f32,
     pub width: f32,
+    pub height: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -186,11 +206,13 @@ pub struct TreeEdge {
     pub parent_y: f32,
     pub child_x: f32,
     pub child_y: f32,
+    pub muted: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ViewContent {
     pub name: String,
+    pub warning: Option<String>,
     pub term: Option<Arc<TreeLayout>>,
     pub value: ValuePresentation,
     pub evaluated: Option<Arc<EvaluatedAlgebraValue>>,
@@ -245,4 +267,12 @@ pub struct DerivationPresentation {
     pub index: usize,
     pub weight: f64,
     pub views: Vec<ViewContent>,
+    pub tag: Option<TagPresentation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TagPresentation {
+    pub derived_tree: ViewContent,
+    pub derivation: ViewContent,
+    pub derivation_with_technical: ViewContent,
 }

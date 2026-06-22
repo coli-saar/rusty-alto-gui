@@ -38,45 +38,69 @@ fn tree_svg(layout: &TreeLayout, width: f32, height: f32) -> Vec<u8> {
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}">"#
     )
     .unwrap();
-    svg.push_str(r##"<g fill="none" stroke="#647181" stroke-width="1.2" stroke-linecap="round">"##);
     for edge in &layout.edges {
         write!(
             svg,
-            r#"<line x1="{}" y1="{}" x2="{}" y2="{}"/>"#,
+            r#"<line x1="{}" y1="{}" x2="{}" y2="{}" fill="none" stroke="{}" stroke-width="1.2" stroke-linecap="round"/>"#,
             OFFSET_X + edge.parent_x,
             OFFSET_Y + edge.parent_y,
             OFFSET_X + edge.child_x,
             OFFSET_Y + edge.child_y,
+            if edge.muted { "#b8c0ca" } else { "#647181" },
         )
         .unwrap();
     }
-    svg.push_str("</g>");
-    svg.push_str(r##"<g fill="#ffffff">"##);
     for node in &layout.nodes {
         write!(
             svg,
-            r#"<rect x="{}" y="{}" width="{}" height="30"/>"#,
+            r#"<rect x="{}" y="{}" width="{}" height="{}" rx="3" fill="{}" stroke="{}" stroke-width="1"/>"#,
             OFFSET_X + node.x - node.width / 2.0,
             OFFSET_Y + node.y,
             node.width,
+            node.height,
+            if node.muted { "#f5f6f8" } else { "#ffffff" },
+            if node.muted { "#cbd1d8" } else { "#d4d9df" },
         )
         .unwrap();
     }
-    svg.push_str("</g>");
-    svg.push_str(
-        r##"<g fill="#202733" font-family="Inter, sans-serif" font-size="13" text-anchor="middle" dominant-baseline="middle">"##,
-    );
     for node in &layout.nodes {
+        let color = if node.muted { "#8a949f" } else { "#202733" };
+        let mut line_y = OFFSET_Y + node.y + 15.0;
+        if let Some(top) = &node.top {
+            write!(
+                svg,
+                r#"<text x="{}" y="{}" fill="{}" font-family="Inter, sans-serif" font-size="11" text-anchor="middle" dominant-baseline="middle">↑ {}</text>"#,
+                OFFSET_X + node.x,
+                line_y,
+                color,
+                escape_xml(top),
+            )
+            .unwrap();
+            line_y += 20.0;
+        }
         write!(
             svg,
-            r#"<text x="{}" y="{}">{}</text>"#,
+            r#"<text x="{}" y="{}" fill="{}" font-family="Inter, sans-serif" font-size="13" font-weight="600" text-anchor="middle" dominant-baseline="middle">{}</text>"#,
             OFFSET_X + node.x,
-            OFFSET_Y + node.y + 15.0,
+            line_y,
+            color,
             escape_xml(&node.label),
         )
         .unwrap();
+        line_y += 20.0;
+        if let Some(bottom) = &node.bottom {
+            write!(
+                svg,
+                r#"<text x="{}" y="{}" fill="{}" font-family="Inter, sans-serif" font-size="11" text-anchor="middle" dominant-baseline="middle">↓ {}</text>"#,
+                OFFSET_X + node.x,
+                line_y,
+                color,
+                escape_xml(bottom),
+            )
+            .unwrap();
+        }
     }
-    svg.push_str("</g></svg>");
+    svg.push_str("</svg>");
     svg.into_bytes()
 }
 
@@ -99,15 +123,23 @@ mod tests {
             nodes: vec![
                 TreeNode {
                     label: "a<&".into(),
+                    top: None,
+                    bottom: None,
+                    muted: false,
                     x: 30.0,
                     y: 20.0,
                     width: 58.0,
+                    height: 30.0,
                 },
                 TreeNode {
                     label: "b".into(),
+                    top: None,
+                    bottom: None,
+                    muted: false,
                     x: 30.0,
                     y: 94.0,
                     width: 58.0,
+                    height: 30.0,
                 },
             ],
             edges: vec![TreeEdge {
@@ -115,6 +147,7 @@ mod tests {
                 parent_y: 50.0,
                 child_x: 30.0,
                 child_y: 94.0,
+                muted: false,
             }],
             width: 60.0,
             height: 124.0,

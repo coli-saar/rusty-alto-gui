@@ -1,7 +1,7 @@
 use crate::{
     model::{
         ChartDocument, DerivationPresentation, DocumentTab, GrammarDocument, HeuristicChoice,
-        InputField, StrategyChoice,
+        InputField, PresentationMode, StrategyChoice,
     },
     workers::{LanguageEvent, LanguageWorker},
 };
@@ -23,6 +23,8 @@ pub(crate) struct Workbench {
     pub(crate) strategy: StrategyChoice,
     pub(crate) heuristic: HeuristicChoice,
     pub(crate) stop_at_first_goal: bool,
+    pub(crate) presentation_mode: PresentationMode,
+    pub(crate) show_technical_nodes: bool,
     pub(crate) pending_label: Option<String>,
     pub(crate) active_parse: Option<ParseJob>,
     pub(crate) next_parse_job_id: u64,
@@ -92,6 +94,8 @@ impl Default for Workbench {
             strategy: StrategyChoice::TopDown,
             heuristic: HeuristicChoice::Zero,
             stop_at_first_goal: false,
+            presentation_mode: PresentationMode::RawIrtg,
+            show_technical_nodes: false,
             pending_label: None,
             active_parse: None,
             next_parse_job_id: 1,
