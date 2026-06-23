@@ -10,7 +10,7 @@ pub enum DocumentTab {
     Language,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PresentationMode {
     RawIrtg,
     Tag,

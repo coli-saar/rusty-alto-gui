@@ -66,18 +66,28 @@ fn window_settings() -> window::Settings {
 }
 
 /// Top-level daemon state: one [`Workbench`] per open grammar window.
-#[derive(Default)]
 struct App {
     windows: BTreeMap<window::Id, Workbench>,
-    #[cfg(target_os = "macos")]
-    menu_installed: bool,
+    menu: Box<dyn crate::menu::MenuPresenter>,
     /// Last window to gain focus — the target for app-level menu actions.
-    #[cfg(target_os = "macos")]
     focused: Option<window::Id>,
+    /// Index of the open top-level menu in the iced bar (Linux), if any.
+    menu_open: Option<usize>,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            windows: BTreeMap::new(),
+            menu: crate::menu::presenter(),
+            focused: None,
+            menu_open: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
-enum AppMsg {
+pub(crate) enum AppMsg {
     /// A message originating from a specific window's view/shortcuts.
     Window(window::Id, Message),
     WindowOpened(window::Id),
@@ -93,10 +103,22 @@ enum AppMsg {
     /// A PDF drag-out finished; reports failures back to the originating window.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     PdfDragFinished(window::Id, Result<(), String>),
-    #[cfg(target_os = "macos")]
+    /// An abstract menu activation from any backend.
+    #[allow(dead_code)]
+    Menu(crate::menu::MenuAction),
     WindowFocused(window::Id),
-    #[cfg(target_os = "macos")]
     MenuPoll,
+    /// iced menu bar: toggle a top-level menu open/closed (Linux).
+    #[allow(dead_code)]
+    MenuToggle(usize),
+    #[allow(dead_code)]
+    MenuClose,
+    /// Raw Win32 HWND for a newly opened window; used to attach the muda menu
+    /// bar (Windows only). The HWND is extracted inside `iced::window::run`
+    /// (which requires Send) and forwarded here where we can call
+    /// `muda::Menu::init_for_hwnd` on the non-Send menu handle.
+    #[cfg(target_os = "windows")]
+    WindowHwnd(window::Id, isize),
 }
 
 fn app_title(app: &App, id: window::Id) -> String {
@@ -114,10 +136,12 @@ fn window_title(state: &Workbench) -> String {
 }
 
 fn app_view(app: &App, id: window::Id) -> Element<'_, AppMsg> {
-    match app.windows.get(&id) {
+    let body: Element<'_, AppMsg> = match app.windows.get(&id) {
         Some(window) => view(window).map(move |message| AppMsg::Window(id, message)),
         None => space::horizontal().into(),
-    }
+    };
+    let bar = crate::menu::bar_view(app.menu_open, &menu_context(app));
+    iced::widget::column![bar, body].into()
 }
 
 fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
@@ -206,8 +230,7 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
                 if let Some(window) = app.windows.get_mut(&target) {
                     window.apply_grammar(Ok(document));
                 }
-                #[cfg(target_os = "macos")]
-                sync_view_menu(app);
+                app.menu.sync(&menu_context(app));
                 Task::none()
             }
             Err(error) if opened_new => {
@@ -226,19 +249,25 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
             }
         },
         AppMsg::WindowOpened(id) => {
-            // Install the native menu bar once, now that NSApp is running on the
-            // main thread (this update runs on the winit/main thread), and add
-            // the new window to the Window menu.
-            #[cfg(target_os = "macos")]
-            {
-                if !app.menu_installed {
-                    app.menu_installed = true;
-                    crate::platform_menu::install();
-                }
-                crate::platform_menu::refresh_windows_menu();
-                sync_view_menu(app);
+            app.menu.install();
+            app.menu.window_opened(id);
+            app.menu.sync(&menu_context(app));
+            #[cfg(target_os = "windows")]
+            if app.menu.windows_menu().is_some() {
+                return Task::batch([get_hwnd(id), window::gain_focus(id)]);
             }
             window::gain_focus(id)
+        }
+        #[cfg(target_os = "windows")]
+        AppMsg::WindowHwnd(_id, hwnd) => {
+            if hwnd != 0 {
+                if let Some(menu) = app.menu.windows_menu() {
+                    // SAFETY: hwnd is a valid Win32 HWND obtained from
+                    // raw-window-handle 0.6 immediately after window creation.
+                    let _ = unsafe { menu.init_for_hwnd(hwnd) };
+                }
+            }
+            Task::none()
         }
         AppMsg::CloseWindow(id) => {
             app.windows.remove(&id);
@@ -254,71 +283,27 @@ fn app_update(app: &mut App, message: AppMsg) -> Task<AppMsg> {
             }
             Task::none()
         }
-        #[cfg(target_os = "macos")]
+        AppMsg::Menu(action) => apply_menu_action(app, action),
         AppMsg::WindowFocused(id) => {
             app.focused = Some(id);
-            sync_view_menu(app);
+            app.menu.sync(&menu_context(app));
             Task::none()
         }
-        #[cfg(target_os = "macos")]
         AppMsg::MenuPoll => {
+            let actions = app.menu.poll();
             let mut tasks = Vec::new();
-            while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
-                match event.id.0.as_str() {
-                    crate::platform_menu::OPEN_GRAMMAR_ID => {
-                        // Open into the focused window (its handler decides
-                        // whether to reuse the window or spawn a new one).
-                        let target = app.focused.or_else(|| app.windows.keys().next().copied());
-                        if let Some(id) = target {
-                            tasks.push(app_update(app, AppMsg::Window(id, Message::OpenGrammar)));
-                        }
-                    }
-                    crate::platform_menu::NEW_PARSE_ID => {
-                        if let Some(id) = app.focused.or_else(|| app.windows.keys().next().copied())
-                        {
-                            tasks.push(app_update(app, AppMsg::Window(id, Message::NewParse)));
-                        }
-                    }
-                    crate::platform_menu::CLOSE_ALL_ID => {
-                        app.windows.clear();
-                        tasks.push(iced::exit());
-                    }
-                    crate::platform_menu::KEYBOARD_SHORTCUTS_ID => {
-                        if let Some(id) = app.focused.or_else(|| app.windows.keys().next().copied())
-                        {
-                            tasks.push(app_update(app, AppMsg::Window(id, Message::ShowShortcuts)));
-                        }
-                    }
-                    crate::platform_menu::VIEW_TAG_ID => {
-                        if let Some(id) = app.focused.or_else(|| app.windows.keys().next().copied())
-                        {
-                            tasks.push(app_update(
-                                app,
-                                AppMsg::Window(
-                                    id,
-                                    Message::SetPresentationMode(PresentationMode::Tag),
-                                ),
-                            ));
-                            sync_view_menu(app);
-                        }
-                    }
-                    crate::platform_menu::VIEW_IRTG_ID => {
-                        if let Some(id) = app.focused.or_else(|| app.windows.keys().next().copied())
-                        {
-                            tasks.push(app_update(
-                                app,
-                                AppMsg::Window(
-                                    id,
-                                    Message::SetPresentationMode(PresentationMode::RawIrtg),
-                                ),
-                            ));
-                            sync_view_menu(app);
-                        }
-                    }
-                    _ => {}
-                }
+            for action in actions {
+                tasks.push(apply_menu_action(app, action));
             }
             Task::batch(tasks)
+        }
+        AppMsg::MenuToggle(index) => {
+            app.menu_open = if app.menu_open == Some(index) { None } else { Some(index) };
+            Task::none()
+        }
+        AppMsg::MenuClose => {
+            app.menu_open = None;
+            Task::none()
         }
     }
 }
@@ -365,23 +350,75 @@ fn start_pdf_drag(
     })
 }
 
-#[cfg(target_os = "macos")]
-fn sync_view_menu(app: &App) {
+/// Extract the Win32 HWND of a window and return it as `AppMsg::WindowHwnd`.
+///
+/// `muda::Menu` is not `Send` (it contains `Rc` internally), so we cannot move
+/// it into the `iced::window::run` closure (which requires `Send + 'static`).
+/// Instead we extract only the `isize` HWND here — which is `Send` — and
+/// deliver it back to `app_update` as `AppMsg::WindowHwnd`, where the non-Send
+/// `muda::Menu` is available via `app.menu` and we call `init_for_hwnd` there.
+#[cfg(target_os = "windows")]
+fn get_hwnd(id: window::Id) -> Task<AppMsg> {
+    use raw_window_handle::RawWindowHandle;
+    iced::window::run(id, move |window| {
+        let hwnd = if let Ok(handle) = window.window_handle()
+            && let RawWindowHandle::Win32(h) = handle.as_raw()
+        {
+            h.hwnd.get()
+        } else {
+            0
+        };
+        AppMsg::WindowHwnd(id, hwnd)
+    })
+}
+
+/// Snapshot the focused window for menu enabled/checked computation.
+fn menu_context(app: &App) -> crate::menu::MenuContext {
     let state = app
         .focused
         .and_then(|id| app.windows.get(&id))
         .or_else(|| app.windows.values().next());
-    let tag_available = state
-        .and_then(|state| state.grammar.as_ref())
-        .is_some_and(|grammar| grammar.detected_mode == PresentationMode::Tag);
-    let grammar_loaded = state.is_some_and(|state| state.grammar.is_some());
-    let mode = state.map(|state| state.presentation_mode);
-    crate::platform_menu::update_view_mode(
-        grammar_loaded,
-        tag_available,
-        mode == Some(PresentationMode::Tag),
-        mode == Some(PresentationMode::RawIrtg),
-    );
+    crate::menu::MenuContext {
+        grammar_loaded: state.is_some_and(|s| s.grammar.is_some()),
+        tag_available: state
+            .and_then(|s| s.grammar.as_ref())
+            .is_some_and(|g| g.detected_mode == PresentationMode::Tag),
+        mode: state.map(|s| s.presentation_mode),
+    }
+}
+
+/// Apply an abstract menu activation. Written once; every backend funnels here.
+fn apply_menu_action(app: &mut App, action: crate::menu::MenuAction) -> Task<AppMsg> {
+    app.menu_open = None;
+    use crate::menu::MenuAction;
+    let focused = app.focused.or_else(|| app.windows.keys().next().copied());
+    match action {
+        MenuAction::OpenGrammar => match focused {
+            Some(id) => app_update(app, AppMsg::Window(id, Message::OpenGrammar)),
+            None => Task::none(),
+        },
+        MenuAction::NewParse => match focused {
+            Some(id) => app_update(app, AppMsg::Window(id, Message::NewParse)),
+            None => Task::none(),
+        },
+        MenuAction::KeyboardShortcuts => match focused {
+            Some(id) => app_update(app, AppMsg::Window(id, Message::ShowShortcuts)),
+            None => Task::none(),
+        },
+        MenuAction::CloseAllWindows => {
+            app.windows.clear();
+            iced::exit()
+        }
+        MenuAction::SetView(mode) => match focused {
+            Some(id) => {
+                let task = app_update(app, AppMsg::Window(id, Message::SetPresentationMode(mode)));
+                app.menu.sync(&menu_context(app));
+                task
+            }
+            None => Task::none(),
+        },
+        MenuAction::Predefined(_) => Task::none(),
+    }
 }
 
 fn app_subscription(app: &App) -> Subscription<AppMsg> {
@@ -412,16 +449,12 @@ fn app_subscription(app: &App) -> Subscription<AppMsg> {
         Event::Window(window::Event::Resized(size)) => {
             Some(AppMsg::Window(id, Message::WindowResized(size)))
         }
-        #[cfg(target_os = "macos")]
         Event::Window(window::Event::Focused) => Some(AppMsg::WindowFocused(id)),
         _ => None,
     });
     let closes = window::close_requests().map(AppMsg::CloseWindow);
-    // `mut` is only used on macOS, where the menu poll is pushed below.
-    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut subscriptions = vec![polling, events, closes];
-    // Drain native menu activations (Open grammar / Close All Windows).
-    #[cfg(target_os = "macos")]
+    // Drain native menu activations (macOS/Windows). Harmless elsewhere.
     subscriptions.push(iced::time::every(Duration::from_millis(120)).map(|_| AppMsg::MenuPoll));
     Subscription::batch(subscriptions)
 }

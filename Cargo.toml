@@ -32,22 +32,17 @@ usvg = "0.45"
 resvg = "0.45"
 tiny-skia = "0.11"
 
-# Native drag-out of a generated PDF (drag a tree straight into Finder/Explorer).
-# The `drag` crate accepts a raw-window-handle on macOS and Windows, which iced
-# exposes via `window::run`. On Linux it requires a GTK ApplicationWindow, which
-# a winit-based app like iced cannot provide, so the PDF drag-out feature simply
-# does not exist on Linux (the trigger is not wired there).
+# macOS + Windows platform dependencies. `drag` starts native drag-out; `muda`
+# drives the native menu bar (top-of-screen on macOS, per-window HWND on
+# Windows); `raw-window-handle` is used by both. On Linux there is no OS menu
+# server and no drag protocol, so neither feature is wired there.
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 drag = "2.1.1"
-
-# Native menu bar. A top-of-screen menu bar is a macOS concept (and iced 0.13
-# doesn't expose the per-window handles Windows/Linux menus need), so this is
-# macOS-only for now. muda is a cross-platform menu crate, so extending to other
-# platforms later means adding the dep + an init call rather than a rewrite.
-[target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.15"
-# AppKit doesn't auto-track winit's windows in the Window menu, so we add them
-# ourselves via NSApplication.addWindowsItem. (objc2 versions match muda's.)
+raw-window-handle = "0.6"
+
+# AppKit window tracking for the macOS Window menu (objc2 versions match muda's).
+[target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSWindow", "NSResponder", "NSMenu", "NSMenuItem"] }
 objc2-foundation = { version = "0.2.2", features = ["NSArray", "NSString"] }
 

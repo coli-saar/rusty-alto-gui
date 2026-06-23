@@ -1,6 +1,6 @@
 use iced::{
     Border, Color, Shadow, Theme,
-    widget::{button, container, rule},
+    widget::{button, container, rule, text},
 };
 
 pub const SIDEBAR_WIDTH: f32 = 280.0;
@@ -72,6 +72,12 @@ pub fn workspace(_: &Theme) -> container::Style {
         background: Some(CANVAS.into()),
         text_color: Some(TEXT),
         ..container::Style::default()
+    }
+}
+
+pub fn muted_text(_: &Theme) -> text::Style {
+    text::Style {
+        color: Some(MUTED),
     }
 }
 
